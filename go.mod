@@ -8,7 +8,7 @@ require (
 	go.opentelemetry.io/otel v1.38.0
 	go.opentelemetry.io/otel/metric v1.38.0
 	go.opentelemetry.io/otel/trace v1.38.0
-	golang.org/x/time v0.13.0
+	golang.org/x/time v0.14.0
 )
 
 require (
