@@ -35,6 +35,8 @@ type Pool struct {
 	gc          map[*pgx.Conn]struct{}
 
 	ctxPropagation ContextPropagationBehaviour
+
+	logger *slog.Logger
 }
 
 type poolCfg struct {
@@ -42,6 +44,7 @@ type poolCfg struct {
 	maxRetries     int
 	connectRate    time.Duration
 	ctxPropagation ContextPropagationBehaviour
+	logger         *slog.Logger
 }
 
 func NewPool(
@@ -85,6 +88,7 @@ func NewPool(
 		ctxPropagation: cfg.ctxPropagation,
 		nodeForConn:    make(map[*pgx.Conn]uint32, 0),
 		gc:             make(map[*pgx.Conn]struct{}, 0),
+		logger:         cfg.logger,
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
@@ -379,7 +383,10 @@ func (p *Pool) connsPerNode() map[uint32]int {
 }
 
 func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (*pgxpool.Conn, error) {
-	slog.DebugContext(ctx, "crdbpgx: acquiring connection from a different node", slog.Uint64("current_node_id", uint64(currentNodeID)))
+	p.debug(ctx, "crdbpgx: acquiring connection from a different node",
+		slog.Uint64("current_node_id", uint64(currentNodeID)),
+	)
+
 	span := trace.SpanFromContext(ctx)
 	span.AddEvent("acquiring connection from different node", trace.WithAttributes(
 		attribute.Int64("current_node_id", int64(currentNodeID)),
@@ -395,7 +402,10 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 		}
 
 		if p.health.NumHealthyNodes() <= 1 {
-			slog.DebugContext(ctx, "crdbpgx: only one healthy node available, reuse connection", slog.Uint64("current_node_id", uint64(currentNodeID)))
+			p.debug(ctx, "crdbpgx: only one healthy node available, reuse connection",
+				slog.Uint64("current_node_id", uint64(currentNodeID)),
+			)
+
 			span.AddEvent("only one healthy node available, reuse connection", trace.WithAttributes(
 				attribute.Int64("current_node_id", int64(currentNodeID)),
 			))
@@ -408,7 +418,10 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			continue
 		}
 
-		slog.DebugContext(ctx, "crdbpgx: acquired connection from different node", slog.Uint64("node_id", uint64(id)))
+		p.debug(ctx, "crdbpgx: acquired connection from different node",
+			slog.Uint64("node_id", uint64(id)),
+		)
+
 		span.AddEvent("acquired connection from different node", trace.WithAttributes(attribute.Int64("node_id", int64(id))))
 		return conn, nil
 	}
@@ -448,7 +461,9 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if err == nil {
 			conn.Release()
 			if retries > 0 {
-				slog.DebugContext(ctx, "ctdbpgx: successful query after retries", slog.Uint64("retries", uint64(retries)))
+				p.debug(ctx, "ctdbpgx: successful query after retries",
+					slog.Uint64("retries", uint64(retries)),
+				)
 			}
 			return nil
 		}
@@ -459,7 +474,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			retryableErr  *RetryableError
 		)
 		if errors.As(err, &resettableErr) || conn.Conn().IsClosed() {
-			slog.DebugContext(ctx, "crdbpgx: resetting connection", slog.Uint64("retries", uint64(retries)))
+			p.debug(ctx, "crdbpgx: resetting connection", slog.Uint64("retries", uint64(retries)))
 
 			nodeID := p.NodeID(conn.Conn())
 			p.GCMark(conn.Conn())
@@ -478,7 +493,9 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			}
 			continue
 		} else if errors.As(err, &retryableErr) {
-			slog.DebugContext(ctx, "crdbpgx: retryable error", slog.Uint64("retries", uint64(retries)), slog.Any("error", err))
+			p.debug(ctx, "crdbpgx: retryable error",
+				slog.Uint64("retries", uint64(retries)), slog.Any("error", err),
+			)
 			sleepOnErr(ctx, retries)
 			continue
 		}
@@ -487,9 +504,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		conn.Release()
 
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			slog.DebugContext(
-				ctx,
-				"crdbpgx: non-retryable error",
+			p.debug(ctx, "crdbpgx: non-retryable error",
 				slog.Uint64("retries", uint64(retries)),
 				slog.Any("error", err),
 			)
@@ -502,6 +517,14 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		MaxRetries: maxRetries,
 		LastErr:    err,
 	}
+}
+
+func (p *Pool) debug(ctx context.Context, msg string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+
+	p.logger.DebugContext(ctx, msg, args...)
 }
 
 func sleepOnErr(ctx context.Context, retries uint) {

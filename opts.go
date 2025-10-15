@@ -1,6 +1,9 @@
 package crdbpgx
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 const (
 	// DefaultMaxRetries gives the number of transaction retries for a single transaction.
@@ -54,5 +57,13 @@ func WithConnectRate(rate time.Duration) Opt {
 func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Opt {
 	return func(pc *poolCfg) {
 		pc.ctxPropagation = behavior
+	}
+}
+
+// WithLogger configures the logger [Pool].
+// By default, no logger is used.
+func WithLogger(l *slog.Logger) Opt {
+	return func(pc *poolCfg) {
+		pc.logger = l
 	}
 }
