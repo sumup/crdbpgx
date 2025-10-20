@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	defaultBalancingTimeout = 10 * time.Second
+	defaultBalancingInterval = 30 * time.Second
+	defaultBalancingTimeout  = 10 * time.Second
 )
 
 type balancerMetrics struct {
@@ -71,16 +72,16 @@ type nodeConnectionBalancer struct {
 // Parameters:
 //   - pool: The connection pool to balance
 //   - healthTracker: Node health tracker for determining node availability
-//   - interval: How often to perform rebalancing
 //   - opts: Optional configuration (see [NodeConnectionBalancerOpt])
+//
+// If no interval is specified via [WithBalancingInterval], the default is 30 seconds.
 func NewNodeConnectionBalancer(
 	pool *Pool,
 	healthTracker *NodeHealthTracker,
-	interval time.Duration,
 	opts ...NodeConnectionBalancerOpt,
 ) *nodeConnectionBalancer {
 	nb := &nodeConnectionBalancer{
-		ticker:         time.NewTicker(interval),
+		ticker:         time.NewTicker(defaultBalancingInterval),
 		mu:             &sync.Mutex{},
 		pool:           pool,
 		healthTracker:  healthTracker,
@@ -98,6 +99,14 @@ func NewNodeConnectionBalancer(
 
 // NodeConnectionBalancerOpt is a functional option for configuring a connection balancer.
 type NodeConnectionBalancerOpt func(*nodeConnectionBalancer)
+
+// WithBalancingInterval sets how often to perform connection rebalancing.
+// Default: 30 seconds.
+func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOpt {
+	return func(b *nodeConnectionBalancer) {
+		b.ticker.Reset(interval)
+	}
+}
 
 // WithBalancingTimeout sets the timeout for an individual balancing operation.
 // Default: 10 seconds.
