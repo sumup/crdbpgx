@@ -13,15 +13,22 @@ import (
 )
 
 const (
+	// CrdbRetryErrCode is the PostgreSQL error code for transaction retry errors in CockroachDB.
 	// https://www.cockroachlabs.com/docs/stable/common-errors.html#restart-transaction
 	CrdbRetryErrCode = "40001"
+
+	// CrdbAmbiguousErrorCode is the PostgreSQL error code for ambiguous result errors in CockroachDB.
 	// https://www.cockroachlabs.com/docs/stable/common-errors.html#result-is-ambiguous
 	CrdbAmbiguousErrorCode = "40003"
+
+	// CrdbServerNotAcceptingClients is the PostgreSQL error code when a CockroachDB node is shutting down.
 	// https://www.cockroachlabs.com/docs/stable/node-shutdown.html#connection-retry-loop
 	CrdbServerNotAcceptingClients = "57P01"
-	// Error when SqlState is unknown
+
+	// CrdbUnknownSQLState is returned when the SQL state cannot be determined.
 	CrdbUnknownSQLState = "XXUUU"
-	// Error message encountered when crdb nodes have large clock skew
+
+	// CrdbClockSkewMessage is the error message when CockroachDB nodes have large clock skew.
 	CrdbClockSkewMessage = "cannot specify timestamp in the future"
 
 	errMsgResettable = "resettable error"
@@ -50,7 +57,10 @@ func wrapSQLError(ctx context.Context, err error) error {
 	return err
 }
 
-// IsRetryableError returns true if the given error is a CockroachDB retryable error.
+// IsRetryableError returns true if the error is a CockroachDB retryable error.
+//
+// Retryable errors are serialization conflicts that can be resolved by retrying
+// the transaction. The connection remains valid and can be reused.
 func IsRetryableError(ctx context.Context, err error) bool {
 	sqlState := sqlErrorCode(err)
 	if sqlState == "" {
@@ -67,7 +77,12 @@ func IsRetryableError(ctx context.Context, err error) bool {
 	}
 }
 
-// IsResettableError returns true if the error is a CockroachDB resetabble error.
+// IsResettableError returns true if the error indicates that the connection
+// should be reset and a retry attempted on a different node.
+//
+// Resettable errors typically indicate node failures, network issues, or
+// ambiguous transaction results. The connection is no longer usable and
+// should be replaced.
 func IsResettableError(ctx context.Context, err error) bool {
 	// We check if the error is likely caused by an error that would occur if a node is taken offline
 	errMsg := err.Error()
@@ -100,6 +115,7 @@ func sqlErrorCode(err error) string {
 	return pgErr.SQLState()
 }
 
+// MaxRetryError is returned when the maximum number of retries has been exceeded.
 type MaxRetryError struct {
 	MaxRetries uint
 	LastErr    error
@@ -132,6 +148,7 @@ func (e *MaxRetryError) GRPCStatus() *status.Status {
 	return s
 }
 
+// ResettableError wraps an error that requires connection reset and retry on a different node.
 type ResettableError struct {
 	Err error
 }
@@ -152,7 +169,7 @@ func (e *ResettableError) GRPCStatus() *status.Status {
 	return status.New(codes.Unavailable, e.Error())
 }
 
-// RetryableError is an error that can be retried against the existing connection.
+// RetryableError wraps an error that can be retried on the same connection.
 type RetryableError struct {
 	Err error
 }

@@ -17,6 +17,7 @@ const (
 	DefaultContextPropagationBehaviour = ContextPropagationDetach
 )
 
+// Opt is a functional option for configuring a [Pool].
 type Opt func(*poolCfg)
 
 func defaultPoolCfg() *poolCfg {
@@ -28,40 +29,41 @@ func defaultPoolCfg() *poolCfg {
 	}
 }
 
-// WithName configures the database name of o11y.
-// The default if not defined is `crdbpgx`.
+// WithName configures the pool name used for observability (metrics and tracing).
+// The default if not specified is "crdbpgx".
 func WithName(name string) Opt {
 	return func(pc *poolCfg) {
 		pc.name = name
 	}
 }
 
-// WithMaxRetries configures the per-database-operation retry count in case of a node
-// unavailability. The default is defined by [DefaultMaxRetries].
+// WithMaxRetries configures the maximum number of retries per database operation
+// when encountering retryable errors. The default is [DefaultMaxRetries].
 func WithMaxRetries(retries int) Opt {
 	return func(pc *poolCfg) {
 		pc.maxRetries = retries
 	}
 }
 
-// WithConnectRate configures the rate at which the pool will try to connect to the database.
-// The default is defined by [DefaultConnectRate].
+// WithConnectRate configures the rate limit for establishing new connections to the database.
+// This helps prevent connection storms. The default is [DefaultConnectRate].
 func WithConnectRate(rate time.Duration) Opt {
 	return func(pc *poolCfg) {
 		pc.connectRate = rate
 	}
 }
 
-// WithContextPropagationBehaviour configures the context propagation behavior.
-// See [ContextPropagationBehaviour] for available options.
+// WithContextPropagationBehaviour configures how contexts are propagated from callers
+// to database operations. See [ContextPropagationBehaviour] for available options.
+// The default is [DefaultContextPropagationBehaviour].
 func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Opt {
 	return func(pc *poolCfg) {
 		pc.ctxPropagation = behavior
 	}
 }
 
-// WithLogger configures the logger [Pool].
-// By default, no logger is used.
+// WithLogger configures the logger for the [Pool].
+// By default, no logger is configured and debug logging is disabled.
 func WithLogger(l *slog.Logger) Opt {
 	return func(pc *poolCfg) {
 		pc.logger = l

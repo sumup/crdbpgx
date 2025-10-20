@@ -5,12 +5,14 @@ import (
 	"time"
 )
 
+// Jitter applies randomness to durations to prevent thundering herd problems.
 type Jitter interface {
-	// Jitter consumes an internal from a ticker and returns a jittered duration.
+	// Jitter consumes an interval from a ticker and returns a jittered duration.
 	Jitter(time.Duration) time.Duration
 }
 
-// Jittered ticker as a time.Ticker with an additional Jitter applied to the duration.
+// JitteredTicker is a ticker with an additional jitter applied to the interval.
+// Similar to time.Ticker but with randomized intervals.
 type JitteredTicker struct {
 	C         <-chan time.Time
 	controlCh chan struct{}
@@ -18,6 +20,8 @@ type JitteredTicker struct {
 	interval time.Duration
 }
 
+// NewJitteredTicker creates a new jittered ticker that ticks at intervals
+// around the specified duration, modified by the provided jitter.
 func NewJitteredTicker(d time.Duration, j Jitter) *JitteredTicker {
 	c := make(chan time.Time)
 	t := &JitteredTicker{
@@ -30,6 +34,7 @@ func NewJitteredTicker(d time.Duration, j Jitter) *JitteredTicker {
 	return t
 }
 
+// Stop stops the jittered ticker. After Stop, no more ticks will be sent.
 func (t *JitteredTicker) Stop() {
 	close(t.controlCh)
 }
@@ -54,14 +59,18 @@ func (t *JitteredTicker) loop(c chan<- time.Time) {
 	}
 }
 
-// Jitter with uniform distribution.
+// UniformJitter implements uniform jitter distribution.
+//
+// The jittered duration is uniformly distributed between Min and the provided duration.
+// This helps distribute load more evenly and prevents synchronized retries across clients.
 type UniformJitter struct {
 	Source *rand.Rand
 	Min    time.Duration
 }
 
-// Jitter the duration uniformly over the range [Min, d).
-// The zero-value is ready to use.  Panics if d <= Min.
+// Jitter returns a duration uniformly distributed over the range [Min, d).
+// The zero-value is ready to use with the default random source.
+// Panics if d <= Min.
 func (u UniformJitter) Jitter(d time.Duration) time.Duration {
 	drawUniform := rand.Int63n
 	if u.Source != nil {

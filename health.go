@@ -17,6 +17,11 @@ var (
 	healthyCRDBNodeCountGauge metric.Int64Gauge
 )
 
+// NodeHealthTracker monitors the health status of CockroachDB nodes in a cluster.
+//
+// It periodically attempts connections to discover and track node availability,
+// and maintains a registry of healthy nodes for use by connection rebalancing
+// and error recovery mechanisms.
 type NodeHealthTracker struct {
 	mu           sync.RWMutex
 	connConfig   *pgx.ConnConfig
@@ -25,6 +30,11 @@ type NodeHealthTracker struct {
 	newLimiter   func() *rate.Limiter
 }
 
+// NewNodeHealthChecker creates a new [NodeHealthTracker].
+//
+// The tracker uses the provided DSN to periodically probe for healthy nodes
+// in the CockroachDB cluster. The DSN should point to any node in the cluster;
+// the tracker will discover other nodes through successful connections.
 func NewNodeHealthChecker(dsn string) (_ *NodeHealthTracker, err error) {
 	if healthyCRDBNodeCountGauge == nil {
 		healthyCRDBNodeCountGauge, err = meter.Int64Gauge(
@@ -51,6 +61,11 @@ func NewNodeHealthChecker(dsn string) (_ *NodeHealthTracker, err error) {
 	}, nil
 }
 
+// Poll continuously checks node health at the specified interval.
+//
+// This should be run in a goroutine. It will run until the context is canceled.
+// The interval specifies how often to attempt a connection to discover and verify
+// node health.
 func (t *NodeHealthTracker) Poll(ctx context.Context, interval time.Duration) {
 	ticker := NewJitteredTicker(interval, &UniformJitter{
 		//nolint:gosec // We use unsecure rand here in an acceptable way.
@@ -94,6 +109,11 @@ func (t *NodeHealthTracker) tryConnection(interval time.Duration) {
 	t.SetNodeStatus(nodeID(conn), true)
 }
 
+// SetNodeStatus updates the health status of a node.
+//
+// If healthy is true, the node is marked as healthy. If false, the node is marked
+// as unhealthy only if it has failed more than twice in the last minute (rate limited
+// to prevent marking nodes as unhealthy due to transient errors).
 func (t *NodeHealthTracker) SetNodeStatus(nodeID uint32, healthy bool) {
 	t.mu.Lock()
 	defer func() {
@@ -123,6 +143,7 @@ func (t *NodeHealthTracker) SetNodeStatus(nodeID uint32, healthy bool) {
 	delete(t.healthyNodes, nodeID)
 }
 
+// IsHealthy returns true if the specified node is currently marked as healthy.
 func (t *NodeHealthTracker) IsHealthy(nodeID uint32) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -130,6 +151,7 @@ func (t *NodeHealthTracker) IsHealthy(nodeID uint32) bool {
 	return ok
 }
 
+// NumHealthyNodes returns the current count of healthy nodes in the cluster.
 func (t *NodeHealthTracker) NumHealthyNodes() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

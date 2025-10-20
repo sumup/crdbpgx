@@ -62,7 +62,17 @@ type nodeConnectionBalancer struct {
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that rebalances connections
-// at the given interval.
+// across CockroachDB nodes at the specified interval.
+//
+// The balancer ensures an even distribution of connections across healthy nodes,
+// pruning excess connections from over-utilized nodes and marking unhealthy
+// node connections for garbage collection.
+//
+// Parameters:
+//   - pool: The connection pool to balance
+//   - healthTracker: Node health tracker for determining node availability
+//   - interval: How often to perform rebalancing
+//   - opts: Optional configuration (see [NodeConnectionBalancerOpt])
 func NewNodeConnectionBalancer(
 	pool *Pool,
 	healthTracker *NodeHealthTracker,
@@ -86,16 +96,23 @@ func NewNodeConnectionBalancer(
 	return nb
 }
 
+// NodeConnectionBalancerOpt is a functional option for configuring a connection balancer.
 type NodeConnectionBalancerOpt func(*nodeConnectionBalancer)
 
-// Sets the timeout for an individual balancing operation.
-// Default: 10 seconds
+// WithBalancingTimeout sets the timeout for an individual balancing operation.
+// Default: 10 seconds.
 func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOpt {
 	return func(b *nodeConnectionBalancer) {
 		b.balanceTimeout = timeout
 	}
 }
 
+// Rebalance continuously rebalances connections at the configured interval.
+//
+// This should be run in a goroutine. It will run until the context is canceled.
+// During each rebalancing cycle, it acquires all idle connections, calculates
+// the optimal distribution across healthy nodes, and marks excess connections
+// for garbage collection.
 func (p *nodeConnectionBalancer) Rebalance(ctx context.Context) {
 	for {
 		select {

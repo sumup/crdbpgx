@@ -24,6 +24,12 @@ var (
 	balancerMeter  *balancerMetrics
 )
 
+// Pool is a CockroachDB-aware connection pool that wraps pgxpool.Pool with automatic
+// retry logic, node health tracking, and connection rebalancing capabilities.
+//
+// Pool provides the same interface as pgxpool.Pool but adds resilience features
+// specifically designed for CockroachDB clusters, including automatic handling of
+// retryable and resettable errors, and intelligent connection management across nodes.
 type Pool struct {
 	pool   *pgxpool.Pool
 	name   string
@@ -47,6 +53,18 @@ type poolCfg struct {
 	logger         *slog.Logger
 }
 
+// NewPool creates a new CockroachDB-aware connection pool.
+//
+// The pool wraps pgxpool.Pool and adds CockroachDB-specific features including
+// automatic retry logic, node health tracking, and connection rebalancing.
+//
+// Parameters:
+//   - ctx: Context for pool initialization
+//   - pgxConfig: pgxpool configuration (a copy will be made internally)
+//   - healthTracker: Node health tracker for monitoring CockroachDB node status
+//   - opts: Optional configuration options (see [Opt] functions)
+//
+// Returns an error if the configuration is invalid or pool creation fails.
 func NewPool(
 	ctx context.Context,
 	pgxConfig *pgxpool.Config,
@@ -184,30 +202,37 @@ func NewPool(
 	return p, nil
 }
 
-// Returns the name of the pool.
+// Name returns the configured name of the pool, used for observability purposes.
 func (p *Pool) Name() string {
 	return p.name
 }
 
-// Returns the maximum number of connections on the underlying pool.
+// MaxConns returns the maximum number of connections in the underlying pool.
 func (p *Pool) MaxConns() int {
 	return int(p.pool.Config().MaxConns)
 }
 
+// MinConns returns the minimum number of connections in the underlying pool.
 func (p *Pool) MinConns() int {
 	return int(p.pool.Config().MinConns)
 }
 
+// Acquire returns a connection from the pool. The connection must be released
+// back to the pool by calling [pgxpool.Conn.Release] on the returned connection.
 func (p *Pool) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
 	ctx = p.contextForAcquire(ctx)
 	return p.acquire(ctx)
 }
 
+// AcquireAllIdle atomically acquires all currently idle connections from the pool.
+// This is primarily used by the connection rebalancer.
 func (p *Pool) AcquireAllIdle(ctx context.Context) []*pgxpool.Conn {
 	ctx = p.contextForAcquire(ctx)
 	return p.pool.AcquireAllIdle(ctx)
 }
 
+// AcquireFunc acquires a connection, calls the provided function with it,
+// and releases the connection when the function returns.
 func (p *Pool) AcquireFunc(ctx context.Context, f func(*pgxpool.Conn) error) error {
 	ctx = p.contextForAcquire(ctx)
 	conn, err := p.acquire(ctx)
@@ -245,15 +270,16 @@ func (p *Pool) acquire(ctx context.Context) (*pgxpool.Conn, error) {
 	return conn, nil
 }
 
+// Ping verifies that a connection to the database is still alive.
 func (p *Pool) Ping(ctx context.Context) error {
 	return p.pool.Ping(p.contextForDBOp(ctx))
 }
 
-// Tx represents a CRDB database transaction.
+// Tx represents a CockroachDB database transaction.
 //
-// Tx can is used in place of [pgx.Tx] and provides additional methods that are also defined
-// on the [Pool] such that users can use the same set of functions both outside and inside
-// a transaction.
+// Tx can be used in place of [pgx.Tx] and provides additional methods that are also defined
+// on [Pool] such that users can use the same set of functions both outside and inside
+// a transaction (ExecFunc, QueryFunc, QueryRowFunc).
 type Tx interface {
 	pgx.Tx
 	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
@@ -261,8 +287,15 @@ type Tx interface {
 	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
 }
 
-// InTxFunc is a replacement for `pgxpool.BeginTxFunc` that resets the connection on resettable errors
-// and retries the transaction on retryable errors.
+// InTxFunc executes a function within a transaction with automatic retry logic.
+//
+// This is a replacement for pgxpool.BeginTxFunc that provides CockroachDB-specific
+// error handling. It resets the connection on resettable errors (e.g., node failures)
+// and retries the transaction on retryable errors (e.g., serialization failures).
+//
+// The transaction is automatically committed if txFunc returns nil, or rolled back
+// if txFunc returns an error. In case of retryable errors, the entire transaction
+// (including txFunc) is re-executed.
 func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc func(Tx) error) error {
 	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
@@ -276,14 +309,18 @@ func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc fun
 
 type crdbTx struct{ pgx.Tx }
 
+// Close closes all connections in the pool and prevents new connections from being acquired.
 func (p *Pool) Close() {
 	p.pool.Close()
 }
 
+// Config returns a copy of the pool's configuration.
 func (p *Pool) Config() *pgxpool.Config {
 	return p.pool.Config().Copy()
 }
 
+// CopyFrom efficiently copies data from rowSrc to the specified table using the PostgreSQL
+// COPY protocol. Note that this operation does not have automatic retry logic.
 func (p *Pool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
 	ctx = p.contextForAcquire(ctx)
 	conn, err := p.pool.Acquire(ctx)
@@ -296,6 +333,8 @@ func (p *Pool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNam
 	return p.pool.CopyFrom(ctx, tableName, columnNames, rowSrc)
 }
 
+// ExecFunc executes a SQL command and calls tagFunc with the command result.
+// The operation includes automatic retry logic for retryable and resettable errors.
 func (p *Pool) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, tag pgconn.CommandTag, err error) error, sql string, arguments ...any) error {
 	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
@@ -304,11 +343,15 @@ func (p *Pool) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, t
 	})
 }
 
+// ExecFunc executes a SQL command within the transaction and calls tagFunc with the result.
 func (t crdbTx) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, tag pgconn.CommandTag, err error) error, sql string, arguments ...any) error {
 	tag, err := t.Exec(ctx, sql, arguments...)
 	return tagFunc(ctx, tag, err)
 }
 
+// QueryFunc executes a SQL query and calls rowsFunc with the resulting rows.
+// The operation includes automatic retry logic for retryable and resettable errors.
+// rowsFunc must close the rows when done.
 func (p *Pool) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context, rows pgx.Rows) error, sql string, optionsAndArgs ...any) error {
 	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
@@ -321,6 +364,7 @@ func (p *Pool) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context,
 	})
 }
 
+// QueryFunc executes a SQL query within the transaction and calls rowsFunc with the resulting rows.
 func (t crdbTx) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context, rows pgx.Rows) error, sql string, optionsAndArgs ...any) error {
 	rows, err := t.Query(ctx, sql, optionsAndArgs...)
 	if err != nil {
@@ -330,6 +374,8 @@ func (t crdbTx) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context
 	return rowsFunc(ctx, rows)
 }
 
+// QueryRowFunc executes a SQL query that returns at most one row and calls rowFunc with the result.
+// The operation includes automatic retry logic for retryable and resettable errors.
 func (p *Pool) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Context, row pgx.Row) error, sql string, optionsAndArgs ...any) error {
 	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
@@ -337,20 +383,26 @@ func (p *Pool) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Contex
 	})
 }
 
+// QueryRowFunc executes a SQL query that returns at most one row within the transaction
+// and calls rowFunc with the result.
 func (t crdbTx) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Context, row pgx.Row) error, sql string, optionsAndArgs ...any) error {
 	row := t.QueryRow(ctx, sql, optionsAndArgs...)
 	return rowFunc(ctx, row)
 }
 
+// SendBatch sends a batch of queries to the database for execution.
+// Note that batch operations do not have automatic retry logic.
 func (p *Pool) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	return p.pool.SendBatch(p.contextForDBOp(ctx), b)
 }
 
+// Stat returns statistics about the connection pool.
 func (p *Pool) Stat() *pgxpool.Stat {
 	return p.pool.Stat()
 }
 
-// NodeID returns the ID of the node a connection uses.
+// NodeID returns the CockroachDB node ID for the given connection.
+// Returns 0 if the connection is not tracked.
 func (p *Pool) NodeID(conn *pgx.Conn) uint32 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -361,7 +413,8 @@ func (p *Pool) NodeID(conn *pgx.Conn) uint32 {
 	return id
 }
 
-// GCMark marks a connection to be destroyed on the next acquire.
+// GCMark marks a connection to be destroyed on the next pool operation (acquire/release).
+// This is used internally for connection rebalancing and when recovering from node failures.
 func (p *Pool) GCMark(conn *pgx.Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
