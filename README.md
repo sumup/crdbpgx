@@ -8,7 +8,7 @@
 
 </div>
 
-A [pgx](https://github.com/jackc/pgx)-compatible driver for [CockroachDB](https://www.cockroachlabs.com/). `crdbpgx` detects CockroachDB gateway nodes health and automatically rebalances connections to ensure optimal performance, even when nodes are failing or draining during upgrades. The driver also transparently handles retryable errors, even for unavailable or draining nodes.
+A [pgx](https://github.com/jackc/pgx)-compatible driver for [CockroachDB](https://www.cockroachlabs.com/). `crdbpgx` supports tracking of CockroachDB gateway nodes health and automatic rebalancing of connections for failing nodes or nodes draining during upgrades. The driver also transparently handles retryable errors.
 
 Inspired by AuthZed's [Maximizing CockroachDB Performance: Our Journey to 1 Million QPS](https://authzed.com/blog/maximizing-cockroachdb-performance) and their implementation [authzed/crdbpool](https://github.com/authzed/crdbpool). Further enhanced with configurable context propagation and improved load-balancing. Distributed under the same license.
 
@@ -36,15 +36,9 @@ func main() {
     panic(fmt.Errorf("parse dsn: %w", err))
   }
 
-  healthChecker, err := crdbpgx.NewNodeHealthChecker(cfg.ConnString())
-  if err != nil {
-    panic(fmt.Errorf("create node health checker: %w", err))
-  }
-
   pool, err = crdbpgx.NewPool(
     ctx, // application context that the pool life-time is tied to
     cfg,
-    healthChecker,
     crdbpgx.WithContextPropagationBehaviour(crdbpgx.ContextPropagationOnAcquire),
   )
   if err != nil {
