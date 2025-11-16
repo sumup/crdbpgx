@@ -24,16 +24,16 @@ var (
 	balancerMeter  *balancerMetrics
 )
 
-// Pool is a CockroachDB-aware connection pool that wraps pgxpool.Pool with automatic
+// Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with automatic
 // retry logic, node health tracking, and connection rebalancing capabilities.
 //
-// Pool provides the same interface as pgxpool.Pool but adds resilience features
+// Pool provides the same interface as [pgxpool.Pool] but adds resilience features
 // specifically designed for CockroachDB clusters, including automatic handling of
 // retryable and resettable errors, and intelligent connection management across nodes.
 type Pool struct {
 	pool   *pgxpool.Pool
 	name   string
-	health *NodeHealthTracker
+	health NodeHealthTracker
 
 	mu          sync.RWMutex
 	maxRetries  int
@@ -43,34 +43,29 @@ type Pool struct {
 	ctxPropagation ContextPropagationBehaviour
 
 	logger *slog.Logger
-}
 
-type poolCfg struct {
-	name           string
-	maxRetries     int
-	connectRate    time.Duration
-	ctxPropagation ContextPropagationBehaviour
-	logger         *slog.Logger
+	onShutdown []func()
 }
 
 // NewPool creates a new CockroachDB-aware connection pool.
 //
-// The pool wraps pgxpool.Pool and adds CockroachDB-specific features including
+// The pool wraps [pgxpool.Pool] and adds CockroachDB-specific features including
 // automatic retry logic, node health tracking, and connection rebalancing.
 //
 // Parameters:
 //   - ctx: Context for pool initialization
 //   - pgxConfig: pgxpool configuration (a copy will be made internally)
 //   - healthTracker: Node health tracker for monitoring CockroachDB node status
-//   - opts: Optional configuration options (see [Opt] functions)
+//   - opts: Optional configuration options (see [Option] functions)
 //
 // Returns an error if the configuration is invalid or pool creation fails.
 func NewPool(
 	ctx context.Context,
 	pgxConfig *pgxpool.Config,
-	healthTracker *NodeHealthTracker,
-	opts ...Opt,
+	opts ...Option,
 ) (_ *Pool, err error) {
+	pgxConfig = pgxConfig.Copy()
+
 	cfg := defaultPoolCfg()
 	for _, opt := range opts {
 		opt(cfg)
@@ -90,6 +85,7 @@ func NewPool(
 			return nil, fmt.Errorf("initialize crdb client resets histogram: %w", err)
 		}
 	}
+
 	if balancerMeter == nil {
 		balancerMeter, err = newBalancerMetrics()
 		if err != nil {
@@ -97,7 +93,22 @@ func NewPool(
 		}
 	}
 
-	pgxConfig = pgxConfig.Copy()
+	// if no custom health tracker was provided we bootstrap one for this
+	// pool automatically
+	healthTracker := cfg.healthTracker
+	var onShutdown []func()
+	if healthTracker == nil {
+		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig)
+		if err != nil {
+			return nil, fmt.Errorf("new node health tracker: %w", err)
+		}
+
+		healthTrackerCtx, cancel := context.WithCancel(context.Background())
+		go nodeHealthTracker.Poll(healthTrackerCtx)
+
+		healthTracker = nodeHealthTracker
+		onShutdown = append(onShutdown, cancel)
+	}
 
 	p := &Pool{
 		name:           cfg.name,
@@ -107,6 +118,7 @@ func NewPool(
 		nodeForConn:    make(map[*pgx.Conn]uint32, 0),
 		gc:             make(map[*pgx.Conn]struct{}, 0),
 		logger:         cfg.logger,
+		onShutdown:     onShutdown,
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
@@ -125,7 +137,7 @@ func NewPool(
 
 		delete(p.nodeForConn, c)
 		delete(p.gc, c)
-		healthTracker.SetNodeStatus(nodeID(c), true)
+		healthTracker.SetStatus(nodeID(c), true)
 
 		if err := limiter.Wait(ctx); err != nil {
 			return err
@@ -246,7 +258,7 @@ func (p *Pool) AcquireFunc(ctx context.Context, f func(*pgxpool.Conn) error) err
 
 func (p *Pool) acquire(ctx context.Context) (*pgxpool.Conn, error) {
 	// pgxpool performs a healthcheck after acquiring a connection that has been in idle state for longer
-	// than one second. This healthcheck involves a Ping operation. If the context is canceled on Acquire,
+	// than one second. This healthcheck involves a Ping operation. If the context is canceled on [Pool.Acquire],
 	// after the connection has been taken from the pool, but before the healthcheck concluded, this
 	// counts as a cancellation of a database operation and results in the destroy of the connection.
 	//
@@ -311,6 +323,9 @@ type crdbTx struct{ pgx.Tx }
 
 // Close closes all connections in the pool and prevents new connections from being acquired.
 func (p *Pool) Close() {
+	for _, callback := range p.onShutdown {
+		callback()
+	}
 	p.pool.Close()
 }
 
@@ -454,7 +469,7 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			return nil, err
 		}
 
-		if p.health.NumHealthyNodes() <= 1 {
+		if p.health.NumHealthy() <= 1 {
 			p.debug(ctx, "crdbpgx: only one healthy node available, reuse connection",
 				slog.Uint64("current_node_id", uint64(currentNodeID)),
 			)
@@ -535,7 +550,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 
 			// If a resettable error occurred, we mark the node as unhealthy.
 			if nodeID > 0 {
-				p.health.SetNodeStatus(nodeID, false)
+				p.health.SetStatus(nodeID, false)
 			}
 
 			sleepOnErr(ctx, 0)

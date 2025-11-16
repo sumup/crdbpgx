@@ -57,9 +57,9 @@ type nodeConnectionBalancer struct {
 	ticker         *time.Ticker
 	mu             *sync.Mutex
 	pool           *Pool
-	healthTracker  *NodeHealthTracker
 	balanceTimeout time.Duration
 	rnd            *rand.Rand
+	logger         *slog.Logger
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that rebalances connections
@@ -71,23 +71,21 @@ type nodeConnectionBalancer struct {
 //
 // Parameters:
 //   - pool: The connection pool to balance
-//   - healthTracker: Node health tracker for determining node availability
-//   - opts: Optional configuration (see [NodeConnectionBalancerOpt])
+//   - opts: Optional configuration (see [NodeConnectionBalancerOption])
 //
 // If no interval is specified via [WithBalancingInterval], the default is 30 seconds.
 func NewNodeConnectionBalancer(
 	pool *Pool,
-	healthTracker *NodeHealthTracker,
-	opts ...NodeConnectionBalancerOpt,
+	opts ...NodeConnectionBalancerOption,
 ) *nodeConnectionBalancer {
 	nb := &nodeConnectionBalancer{
+		mu:             new(sync.Mutex),
 		ticker:         time.NewTicker(defaultBalancingInterval),
-		mu:             &sync.Mutex{},
 		pool:           pool,
-		healthTracker:  healthTracker,
 		balanceTimeout: defaultBalancingTimeout,
 		//nolint:gosec // weak random is fine here
-		rnd: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+		rnd:    rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+		logger: slog.Default(),
 	}
 
 	for _, opt := range opts {
@@ -97,12 +95,12 @@ func NewNodeConnectionBalancer(
 	return nb
 }
 
-// NodeConnectionBalancerOpt is a functional option for configuring a connection balancer.
-type NodeConnectionBalancerOpt func(*nodeConnectionBalancer)
+// NodeConnectionBalancerOption is a configuration option for the connection balancer.
+type NodeConnectionBalancerOption func(*nodeConnectionBalancer)
 
 // WithBalancingInterval sets how often to perform connection rebalancing.
 // Default: 30 seconds.
-func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOpt {
+func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOption {
 	return func(b *nodeConnectionBalancer) {
 		b.ticker.Reset(interval)
 	}
@@ -110,7 +108,7 @@ func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOpt {
 
 // WithBalancingTimeout sets the timeout for an individual balancing operation.
 // Default: 10 seconds.
-func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOpt {
+func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 	return func(b *nodeConnectionBalancer) {
 		b.balanceTimeout = timeout
 	}
@@ -152,12 +150,12 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		),
 	)
 
-	nodeCount := max(p.healthTracker.NumHealthyNodes(), 1)
+	nodeCount := max(p.pool.health.NumHealthy(), 1)
 
 	healthyConns := make(map[uint32][]*pgxpool.Conn, nodeCount)
 	for _, c := range conns {
 		nid := nodeID(c.Conn())
-		if p.healthTracker.IsHealthy(nid) {
+		if p.pool.health.IsHealthy(nid) {
 			if healthyConns[nid] == nil {
 				healthyConns[nid] = make([]*pgxpool.Conn, 0, min(1, len(conns)/nodeCount))
 			}
@@ -183,7 +181,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		cnt := connsPerNode[nodeID]
 		nodeMax := perNodeMax
 
-		if p.healthTracker.NumHealthyNodes() == 0 || i < maxConns%p.healthTracker.NumHealthyNodes() {
+		if p.pool.health.NumHealthy() == 0 || i < maxConns%p.pool.health.NumHealthy() {
 			perNodeMax++
 		}
 
@@ -203,7 +201,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		}
 
 		prunedTotal += int64(toPrune)
-		slog.DebugContext(
+		p.logger.DebugContext(
 			ctx,
 			"balancer: pruned connections",
 			slog.String("library", "github.com/sumup/crdbpgx"),

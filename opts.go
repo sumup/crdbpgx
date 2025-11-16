@@ -17,8 +17,14 @@ const (
 	DefaultContextPropagationBehaviour = ContextPropagationDetach
 )
 
-// Opt is a functional option for configuring a [Pool].
-type Opt func(*poolCfg)
+type poolCfg struct {
+	name           string
+	maxRetries     int
+	connectRate    time.Duration
+	ctxPropagation ContextPropagationBehaviour
+	logger         *slog.Logger
+	healthTracker  NodeHealthTracker
+}
 
 func defaultPoolCfg() *poolCfg {
 	return &poolCfg{
@@ -29,9 +35,12 @@ func defaultPoolCfg() *poolCfg {
 	}
 }
 
+// Option is a configuration option for a [Pool].
+type Option func(*poolCfg)
+
 // WithName configures the pool name used for observability (metrics and tracing).
 // The default if not specified is "crdbpgx".
-func WithName(name string) Opt {
+func WithName(name string) Option {
 	return func(pc *poolCfg) {
 		pc.name = name
 	}
@@ -39,7 +48,7 @@ func WithName(name string) Opt {
 
 // WithMaxRetries configures the maximum number of retries per database operation
 // when encountering retryable errors. The default is [DefaultMaxRetries].
-func WithMaxRetries(retries int) Opt {
+func WithMaxRetries(retries int) Option {
 	return func(pc *poolCfg) {
 		pc.maxRetries = retries
 	}
@@ -47,7 +56,7 @@ func WithMaxRetries(retries int) Opt {
 
 // WithConnectRate configures the rate limit for establishing new connections to the database.
 // This helps prevent connection storms. The default is [DefaultConnectRate].
-func WithConnectRate(rate time.Duration) Opt {
+func WithConnectRate(rate time.Duration) Option {
 	return func(pc *poolCfg) {
 		pc.connectRate = rate
 	}
@@ -56,7 +65,7 @@ func WithConnectRate(rate time.Duration) Opt {
 // WithContextPropagationBehaviour configures how contexts are propagated from callers
 // to database operations. See [ContextPropagationBehaviour] for available options.
 // The default is [DefaultContextPropagationBehaviour].
-func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Opt {
+func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Option {
 	return func(pc *poolCfg) {
 		pc.ctxPropagation = behavior
 	}
@@ -64,8 +73,21 @@ func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Opt {
 
 // WithLogger configures the logger for the [Pool].
 // By default, no logger is configured and debug logging is disabled.
-func WithLogger(l *slog.Logger) Opt {
+func WithLogger(l *slog.Logger) Option {
 	return func(pc *poolCfg) {
 		pc.logger = l
+	}
+}
+
+// WithHealthTracker configures the health tracker used by the pool.
+//
+// You might want to initialize and pass the health tracker to the pool
+// yourself if you use multiple pools for the same database inside one
+// application in which case the pools can share the health tracker.
+//
+// If no custom health tracker is provided a default per-pool one is used.
+func WithHealthTracker(h *nodeHealthTracker) Option {
+	return func(pc *poolCfg) {
+		pc.healthTracker = h
 	}
 }

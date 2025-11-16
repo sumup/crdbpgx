@@ -13,29 +13,56 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const (
+	defaultNodeHealthPollInterval = 5 * time.Second
+)
+
 var (
 	healthyCRDBNodeCountGauge metric.Int64Gauge
 )
 
-// NodeHealthTracker monitors the health status of CockroachDB nodes in a cluster.
+// NodeHealthTracker is responsible for tracking health of a nodes
+// in a CockroachDB cluster.
+type NodeHealthTracker interface {
+	SetStatus(nodeID uint32, healthy bool)
+	IsHealthy(nodeID uint32) bool
+	NumHealthy() int
+}
+
+// nodeHealthTracker monitors the health status of CockroachDB nodes in a cluster.
 //
 // It periodically attempts connections to discover and track node availability,
 // and maintains a registry of healthy nodes for use by connection rebalancing
 // and error recovery mechanisms.
-type NodeHealthTracker struct {
+type nodeHealthTracker struct {
 	mu           sync.RWMutex
 	connConfig   *pgx.ConnConfig
 	healthyNodes map[uint32]struct{}
 	nodesSeen    map[uint32]*rate.Limiter
 	newLimiter   func() *rate.Limiter
+	pollInterval time.Duration
 }
 
-// NewNodeHealthChecker creates a new [NodeHealthTracker].
+type nodeHealthTrackerConfig struct {
+	pollInterval time.Duration
+}
+
+// NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
+type NodeHealthTrackerOption func(*nodeHealthTrackerConfig)
+
+// WithPollInterval configures the interval at which the node health tracker
+// attempts to connect to a random node in the cluster and assert its health.
+func WithPollInterval(d time.Duration) NodeHealthTrackerOption {
+	return func(tracker *nodeHealthTrackerConfig) {
+		tracker.pollInterval = d
+	}
+}
+
+// NewNodeHealthTracker creates a new [nodeHealthTracker].
 //
-// The tracker uses the provided DSN to periodically probe for healthy nodes
-// in the CockroachDB cluster. The DSN should point to any node in the cluster;
-// the tracker will discover other nodes through successful connections.
-func NewNodeHealthChecker(dsn string) (_ *NodeHealthTracker, err error) {
+// The tracker periodically probes for healthy nodes in the CockroachDB cluster
+// and tracks their health.
+func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) (_ *nodeHealthTracker, err error) {
 	if healthyCRDBNodeCountGauge == nil {
 		healthyCRDBNodeCountGauge, err = meter.Int64Gauge(
 			"crdb_healthy_nodes",
@@ -46,13 +73,16 @@ func NewNodeHealthChecker(dsn string) (_ *NodeHealthTracker, err error) {
 		}
 	}
 
-	connConfig, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return nil, err
+	tCfg := &nodeHealthTrackerConfig{
+		pollInterval: defaultNodeHealthPollInterval,
+	}
+	for _, o := range opts {
+		o(tCfg)
 	}
 
-	return &NodeHealthTracker{
-		connConfig:   connConfig,
+	return &nodeHealthTracker{
+		connConfig:   cfg,
+		pollInterval: tCfg.pollInterval,
 		healthyNodes: make(map[uint32]struct{}),
 		nodesSeen:    make(map[uint32]*rate.Limiter),
 		newLimiter: func() *rate.Limiter {
@@ -61,31 +91,33 @@ func NewNodeHealthChecker(dsn string) (_ *NodeHealthTracker, err error) {
 	}, nil
 }
 
-// Poll continuously checks node health at the specified interval.
+// Poll continuously checks health of the nodes in the cluster.
+// On each run, it attempts to connect to a random node in the cluster
+// and tracks its health. This functionality aids with discovery of
+// new nodes in the cluster when scaling up or taking nodes back
+// online after upgrade.
 //
 // This should be run in a goroutine. It will run until the context is canceled.
-// The interval specifies how often to attempt a connection to discover and verify
-// node health.
-func (t *NodeHealthTracker) Poll(ctx context.Context, interval time.Duration) {
-	ticker := NewJitteredTicker(interval, &UniformJitter{
+func (t *nodeHealthTracker) Poll(ctx context.Context) {
+	ticker := NewJitteredTicker(t.pollInterval, &UniformJitter{
 		//nolint:gosec // We use unsecure rand here in an acceptable way.
 		Source: rand.New(rand.NewSource(time.Now().Unix())),
 		// To avoid checking all nodes at the same time with concurrent startup, we apply a jitter.
 		// This should be 20% of the interval, but not longer than a second.
-		Min: min(interval/5, 1*time.Second),
+		Min: min(t.pollInterval/5, 1*time.Second),
 	})
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 		case <-ticker.C:
-			t.tryConnection(interval)
+			t.tryConnection(ctx, t.pollInterval)
 		}
 	}
 }
 
-func (t *NodeHealthTracker) tryConnection(interval time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), interval)
+func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Duration) {
+	ctx, cancel := context.WithTimeout(ctx, interval)
 	defer cancel()
 
 	conn, err := pgx.ConnectConfig(ctx, t.connConfig)
@@ -106,15 +138,15 @@ func (t *NodeHealthTracker) tryConnection(interval time.Duration) {
 	)
 
 	// Connection successful --> mark node health
-	t.SetNodeStatus(nodeID(conn), true)
+	t.SetStatus(nodeID(conn), true)
 }
 
-// SetNodeStatus updates the health status of a node.
+// SetStatus updates the health status of a node.
 //
 // If healthy is true, the node is marked as healthy. If false, the node is marked
 // as unhealthy only if it has failed more than twice in the last minute (rate limited
 // to prevent marking nodes as unhealthy due to transient errors).
-func (t *NodeHealthTracker) SetNodeStatus(nodeID uint32, healthy bool) {
+func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	t.mu.Lock()
 	defer func() {
 		numHealthy := len(t.healthyNodes)
@@ -144,15 +176,15 @@ func (t *NodeHealthTracker) SetNodeStatus(nodeID uint32, healthy bool) {
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.
-func (t *NodeHealthTracker) IsHealthy(nodeID uint32) bool {
+func (t *nodeHealthTracker) IsHealthy(nodeID uint32) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	_, ok := t.healthyNodes[nodeID]
 	return ok
 }
 
-// NumHealthyNodes returns the current count of healthy nodes in the cluster.
-func (t *NodeHealthTracker) NumHealthyNodes() int {
+// NumHealthy returns the current count of healthy nodes in the cluster.
+func (t *nodeHealthTracker) NumHealthy() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.healthyNodes)
