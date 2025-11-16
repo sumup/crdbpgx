@@ -49,6 +49,24 @@ func main() {
 }
 ```
 
+## Components
+
+There are free main components of `crdbpgx`:
+
+### Pool
+
+The database connection pool which is a thin wrapper around `pgxpool` adjusted to CockroachDB that transparently retries retryable errors.
+
+### Node health tracker
+
+Tracks health of nodes in the cluster. This is done in two ways - when executing queries and in a periodical polling loop. In queries, nodes are marked as unhealthy if they fail with a resettable error (i.e. errors that are not a result of a database operation but rather of the underlying connection). The polling mechanism then periodically pings a random node in the cluster and if a node comes back to live or a new node is added their health is tracked as healthy.
+
+The health tracker is owned by the pool as they are coupled closely together but users of this package are free to provide their own implementation of the node health tracker.
+
+### Node connection balancer
+
+Node connection balancer wraps the connection pool with rebalancing functionality. At a specified period the balancer acquires idle connections from the pool and prunes those, that are making the connection distribution among nodes uneven. The balancer functionality ensures that the load is evenly distributed among the nodes in the cluster even during upgrades where nodes drain and come back online or when the cluster is scaled.
+
 ## Credits
 
 - [jackc/pgx](https://github.com/jackc/pgx)
