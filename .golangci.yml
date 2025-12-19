@@ -14,12 +14,12 @@ formatters:
       sections:
         - standard
         - default
-        - prefix(github.com/sumup/sumup-go)
+        - prefix(github.com/sumup/crdbpgx)
         - dot
     gofmt:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/sumup/sumup-go
+        - github.com/sumup/crdbpgx
   exclusions:
     generated: lax
