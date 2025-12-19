@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+
+.cache/
+.tools/
+.idea/
+.vscode/
+go.work
+go.work.sum
+
