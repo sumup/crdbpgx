@@ -73,9 +73,5 @@ func detachContext(ctx context.Context) context.Context {
 		return ctx
 	}
 
-	newCtx := context.WithoutCancel(ctx)
-	newCtx = context.WithValue(newCtx, ctxDetachedKey{}, struct{}{})
-	newCtx = context.WithValue(newCtx, CtxDisableRetries, ctx.Value(CtxDisableRetries))
-
-	return newCtx
+	return WithDisableRetries(context.WithoutCancel(ctx))
 }
