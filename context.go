@@ -2,8 +2,6 @@ package crdbpgx
 
 import (
 	"context"
-
-	"go.opentelemetry.io/otel/trace"
 )
 
 type ctxDisableRetries struct{}
