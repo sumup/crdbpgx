@@ -47,6 +47,10 @@ type Pool struct {
 	onShutdown []func()
 }
 
+var (
+	_ Runner = (*Pool)(nil)
+)
+
 // NewPool creates a new CockroachDB-aware connection pool.
 //
 // The pool wraps [pgxpool.Pool] and adds CockroachDB-specific features including
@@ -287,6 +291,16 @@ func (p *Pool) Ping(ctx context.Context) error {
 	return p.pool.Ping(p.contextForDBOp(ctx))
 }
 
+// Runner is the shared query execution interface implemented by both [Pool] and [Tx].
+//
+// This is the main abstraction for application code that should work both inside
+// and outside of a transaction without relying on context-carried transaction state.
+type Runner interface {
+	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
+	QueryFunc(ctx context.Context, rowsFunc func(context.Context, pgx.Rows) error, sql string, optionsAndArgs ...any) error
+	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
+}
+
 // Tx represents a CockroachDB database transaction.
 //
 // Tx can be used in place of [pgx.Tx] and provides additional methods that are also defined
@@ -294,9 +308,29 @@ func (p *Pool) Ping(ctx context.Context) error {
 // a transaction (ExecFunc, QueryFunc, QueryRowFunc).
 type Tx interface {
 	pgx.Tx
-	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
-	QueryFunc(ctx context.Context, rowsFunc func(context.Context, pgx.Rows) error, sql string, optionsAndArgs ...any) error
-	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
+	Runner
+}
+
+// InTx executes a function within a transaction and passes a [Runner] that should
+// be used for all operations in the transactional unit.
+//
+// The transaction is automatically committed if txFunc returns nil, or rolled back
+// if txFunc returns an error. In case of retryable errors, the entire transaction
+// callback is re-executed.
+//
+// The callback receives the context that should be used for transaction-bound
+// database operations.
+func (p *Pool) InTx(ctx context.Context, txOptions pgx.TxOptions, txFunc func(context.Context, Runner) error) error {
+	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
+		ctx = p.contextForDBOp(ctx)
+		tx, err := conn.BeginTx(ctx, txOptions)
+		if err != nil {
+			return err
+		}
+		return beginFuncExec(ctx, crdbTx{tx}, func(tx Tx) error {
+			return txFunc(ctx, tx)
+		})
+	})
 }
 
 // InTxFunc executes a function within a transaction with automatic retry logic.
@@ -309,17 +343,21 @@ type Tx interface {
 // if txFunc returns an error. In case of retryable errors, the entire transaction
 // (including txFunc) is re-executed.
 func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc func(Tx) error) error {
-	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
-		ctx = p.contextForDBOp(ctx)
-		tx, err := conn.BeginTx(ctx, txOptions)
-		if err != nil {
-			return err
+	return p.InTx(ctx, txOptions, func(_ context.Context, runner Runner) error {
+		tx, ok := runner.(Tx)
+		if !ok {
+			return fmt.Errorf("runner does not implement Tx")
 		}
-		return beginFuncExec(ctx, crdbTx{tx}, txFunc)
+		return txFunc(tx)
 	})
 }
 
 type crdbTx struct{ pgx.Tx }
+
+var (
+	_ Runner = crdbTx{}
+	_ Tx     = crdbTx{}
+)
 
 // Close closes all connections in the pool and prevents new connections from being acquired.
 func (p *Pool) Close() {
