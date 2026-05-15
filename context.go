@@ -50,14 +50,14 @@ const (
 
 func (p *Pool) contextForAcquire(ctx context.Context) context.Context {
 	if p.ctxPropagation > ContextPropagationOnAcquire {
-		ctx = detachedContextWithTelemetry(ctx)
+		return detachContext(ctx)
 	}
 	return ctx
 }
 
 func (p *Pool) contextForDBOp(ctx context.Context) context.Context {
 	if p.ctxPropagation > ContextPropagationPassthrough {
-		ctx = detachedContextWithTelemetry(ctx)
+		return detachContext(ctx)
 	}
 	return ctx
 }
@@ -69,15 +69,13 @@ func isDetachedContext(ctx context.Context) bool {
 	return ctx.Value(ctxDetachedKey{}) != nil
 }
 
-// detachedContextWithTelemetry creates a new background context but copies the span from the passed parent context.
-func detachedContextWithTelemetry(ctx context.Context) context.Context {
+// detachContext creates a context that ignore cancelation of the parent context.
+func detachContext(ctx context.Context) context.Context {
 	if isDetachedContext(ctx) {
 		return ctx
 	}
-	span := trace.SpanFromContext(ctx)
 
-	newCtx := context.Background()
-	newCtx = trace.ContextWithSpan(newCtx, span)
+	newCtx := context.WithoutCancel(ctx)
 	newCtx = context.WithValue(newCtx, ctxDetachedKey{}, struct{}{})
 	newCtx = context.WithValue(newCtx, CtxDisableRetries, ctx.Value(CtxDisableRetries))
 
