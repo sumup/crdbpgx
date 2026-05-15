@@ -12,6 +12,9 @@ A [pgx](https://github.com/jackc/pgx)-compatible driver for [CockroachDB](https:
 
 Inspired by AuthZed's [Maximizing CockroachDB Performance: Our Journey to 1 Million QPS](https://authzed.com/blog/maximizing-cockroachdb-performance) and their implementation [authzed/crdbpool](https://github.com/authzed/crdbpool). Further enhanced with configurable context propagation and improved load-balancing. Distributed under the same license.
 
+> [!IMPORTANT]
+> `crdbpgx` is not a drop-in replacement for `pgx`. It is a CockroachDB-focused wrapper around `pgxpool` that adds node health tracking, connection rebalancing, retry handling, and configurable context propagation. Those behaviors intentionally change how connections are acquired, retried, and managed so applications can better tolerate CockroachDB node failures, draining nodes during upgrades, and gateway imbalance.
+
 ## Example
 
 ```go
@@ -75,3 +78,24 @@ Node connection balancer wraps the connection pool with rebalancing functionalit
 ### Maintainers
 
 - [Johannes Gräger](mailto:johannes.graeger@sumup.com)
+
+## Integration Testing
+
+There is an opt-in Docker-backed integration test that starts a 3-node CockroachDB cluster, stops one node, restarts it, and asserts that `crdbpgx` recovers and re-discovers the node.
+
+Requirements:
+
+- Docker with the local daemon running
+- free host ports `26257-26259` and `8080-8082`
+
+Run it with:
+
+```sh
+make test-integration
+```
+
+The cluster definition lives in [`testdata/crdb-cluster/docker-compose.yml`](./testdata/crdb-cluster/docker-compose.yml). By default it uses `cockroachdb/cockroach:v26.2.0`, but you can override that for local experiments:
+
+```sh
+CRDB_IMAGE=cockroachdb/cockroach:v25.1.10 make test-integration
+```
