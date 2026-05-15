@@ -2,7 +2,6 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"maps"
 	"math/rand/v2"
@@ -11,45 +10,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 )
 
 const (
 	defaultBalancingInterval = 30 * time.Second
 	defaultBalancingTimeout  = 10 * time.Second
 )
-
-type balancerMetrics struct {
-	acquireHist metric.Int64Histogram
-	pruneHist   metric.Int64Histogram
-}
-
-func newBalancerMetrics() (b *balancerMetrics, err error) {
-	b = &balancerMetrics{}
-
-	b.acquireHist, err = meter.Int64Histogram(
-		"crdbpgx.balancer.acquired",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections acquired for pruning"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer acquire histogram: %w", err)
-	}
-
-	b.pruneHist, err = meter.Int64Histogram(
-		"crdbpgx.balancer.pruned",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections pruned per balancing run"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer prune histogram: %w", err)
-	}
-
-	return b, nil
-}
 
 // nodeConnectionBalancer distributes database connections across CockroachDB nodes,
 // rebalancing periodically to maintain even distribution and handle node health changes.
@@ -144,11 +110,6 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 			c.Release()
 		}
 	}()
-	balancerMeter.acquireHist.Record(ctx, int64(len(conns)),
-		metric.WithAttributes(
-			attribute.String("pool.id", p.pool.Name()),
-		),
-	)
 
 	nodeCount := max(p.pool.health.NumHealthy(), 1)
 
@@ -175,7 +136,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 	maxConns := p.pool.MaxConns()
 	perNodeMax := maxConns / nodeCount
 
-	var prunedTotal int64
+	var prunedTotal int
 
 	for i, nodeID := range nodes {
 		cnt := connsPerNode[nodeID]
@@ -200,7 +161,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 			p.pool.GCMark(c.Conn())
 		}
 
-		prunedTotal += int64(toPrune)
+		prunedTotal += toPrune
 		p.logger.DebugContext(
 			ctx,
 			"balancer: pruned connections",
@@ -214,9 +175,9 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		)
 	}
 
-	balancerMeter.pruneHist.Record(ctx, prunedTotal,
-		metric.WithAttributes(
-			attribute.String("pool.id", p.pool.Name()),
-		),
-	)
+	p.pool.hooks.balancerRun(ctx, BalancerRunEvent{
+		PoolName:          p.pool.Name(),
+		AcquiredIdleConns: len(conns),
+		PrunedConns:       prunedTotal,
+	})
 }

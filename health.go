@@ -2,23 +2,17 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/time/rate"
 )
 
 const (
 	defaultNodeHealthPollInterval = 5 * time.Second
-)
-
-var (
-	healthyCRDBNodeCountGauge metric.Int64Gauge
 )
 
 // NodeHealthTracker is responsible for tracking health of a nodes
@@ -41,10 +35,12 @@ type nodeHealthTracker struct {
 	nodesSeen    map[uint32]*rate.Limiter
 	newLimiter   func() *rate.Limiter
 	pollInterval time.Duration
+	hooks        hookSet
 }
 
 type nodeHealthTrackerConfig struct {
 	pollInterval time.Duration
+	hooks        hookSet
 }
 
 // NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
@@ -58,21 +54,18 @@ func WithPollInterval(d time.Duration) NodeHealthTrackerOption {
 	}
 }
 
+// WithNodeHealthHooks configures lifecycle hooks used by the health tracker.
+func WithNodeHealthHooks(hooks ...Hooks) NodeHealthTrackerOption {
+	return func(tracker *nodeHealthTrackerConfig) {
+		tracker.hooks = append(tracker.hooks, hooks...)
+	}
+}
+
 // NewNodeHealthTracker creates a new [nodeHealthTracker].
 //
 // The tracker periodically probes for healthy nodes in the CockroachDB cluster
 // and tracks their health.
 func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) (_ *nodeHealthTracker, err error) {
-	if healthyCRDBNodeCountGauge == nil {
-		healthyCRDBNodeCountGauge, err = meter.Int64Gauge(
-			"crdb_healthy_nodes",
-			metric.WithDescription("Number of health CRDB nodes detected"),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("initialize crdb health nodes gauge: %w", err)
-		}
-	}
-
 	tCfg := &nodeHealthTrackerConfig{
 		pollInterval: defaultNodeHealthPollInterval,
 	}
@@ -88,6 +81,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		newLimiter: func() *rate.Limiter {
 			return rate.NewLimiter(rate.Every(1*time.Minute), 2)
 		},
+		hooks: tCfg.hooks,
 	}, nil
 }
 
@@ -147,12 +141,9 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 // as unhealthy only if it has failed more than twice in the last minute (rate limited
 // to prevent marking nodes as unhealthy due to transient errors).
 func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
+	var event *NodeHealthChangeEvent
+
 	t.mu.Lock()
-	defer func() {
-		numHealthy := len(t.healthyNodes)
-		t.mu.Unlock()
-		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
-	}()
 
 	nodeLimiter, nodeHasBeenSeen := t.nodesSeen[nodeID]
 	if !nodeHasBeenSeen {
@@ -163,16 +154,31 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	if healthy {
 		t.healthyNodes[nodeID] = struct{}{}
 		t.nodesSeen[nodeID] = t.newLimiter()
+		event = &NodeHealthChangeEvent{
+			NodeID:       nodeID,
+			Healthy:      true,
+			HealthyNodes: len(t.healthyNodes),
+		}
+		t.mu.Unlock()
+		t.hooks.nodeHealthChange(context.Background(), *event)
 		return
 	}
 
 	// If the limiter allows the request, we haven't seen more than 2 failures in the past minute.
 	// Keep the node health
 	if nodeLimiter.Allow() {
+		t.mu.Unlock()
 		return
 	}
 
 	delete(t.healthyNodes, nodeID)
+	event = &NodeHealthChangeEvent{
+		NodeID:       nodeID,
+		Healthy:      false,
+		HealthyNodes: len(t.healthyNodes),
+	}
+	t.mu.Unlock()
+	t.hooks.nodeHealthChange(context.Background(), *event)
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.

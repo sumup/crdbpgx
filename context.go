@@ -1,10 +1,6 @@
 package crdbpgx
 
-import (
-	"context"
-
-	"go.opentelemetry.io/otel/trace"
-)
+import "context"
 
 type ctxDisableRetries struct{}
 
@@ -43,21 +39,21 @@ const (
 
 	// ContextPropagationDetach detaches the caller's context completely, creating
 	// a new background context for both connection acquisition and database operations.
-	// Tracing information is preserved. This provides maximum isolation from context
-	// cancellation but operations cannot be canceled by the caller.
+	// Plugin-provided context state is preserved when supported. This provides maximum
+	// isolation from context cancellation but operations cannot be canceled by the caller.
 	ContextPropagationDetach
 )
 
 func (p *Pool) contextForAcquire(ctx context.Context) context.Context {
 	if p.ctxPropagation > ContextPropagationOnAcquire {
-		ctx = detachedContextWithTelemetry(ctx)
+		ctx = p.detachedContext(ctx)
 	}
 	return ctx
 }
 
 func (p *Pool) contextForDBOp(ctx context.Context) context.Context {
 	if p.ctxPropagation > ContextPropagationPassthrough {
-		ctx = detachedContextWithTelemetry(ctx)
+		ctx = p.detachedContext(ctx)
 	}
 	return ctx
 }
@@ -69,15 +65,17 @@ func isDetachedContext(ctx context.Context) bool {
 	return ctx.Value(ctxDetachedKey{}) != nil
 }
 
-// detachedContextWithTelemetry creates a new background context but copies the span from the passed parent context.
-func detachedContextWithTelemetry(ctx context.Context) context.Context {
+// detachedContext creates a new background context while preserving internal state
+// and allowing plugins to copy any additional context values they need.
+func (p *Pool) detachedContext(ctx context.Context) context.Context {
 	if isDetachedContext(ctx) {
 		return ctx
 	}
-	span := trace.SpanFromContext(ctx)
 
 	newCtx := context.Background()
-	newCtx = trace.ContextWithSpan(newCtx, span)
+	if p != nil {
+		newCtx = p.hooks.detachContext(ctx)
+	}
 	newCtx = context.WithValue(newCtx, ctxDetachedKey{}, struct{}{})
 	newCtx = context.WithValue(newCtx, CtxDisableRetries, ctx.Value(CtxDisableRetries))
 

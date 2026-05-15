@@ -24,6 +24,7 @@ type poolCfg struct {
 	ctxPropagation ContextPropagationBehaviour
 	logger         *slog.Logger
 	healthTracker  NodeHealthTracker
+	hooks          hookSet
 }
 
 func defaultPoolCfg() *poolCfg {
@@ -86,8 +87,15 @@ func WithLogger(l *slog.Logger) Option {
 // application in which case the pools can share the health tracker.
 //
 // If no custom health tracker is provided a default per-pool one is used.
-func WithHealthTracker(h *nodeHealthTracker) Option {
+func WithHealthTracker(h NodeHealthTracker) Option {
 	return func(pc *poolCfg) {
 		pc.healthTracker = h
+	}
+}
+
+// WithHooks configures lifecycle hooks that can observe and extend pool behavior.
+func WithHooks(hooks ...Hooks) Option {
+	return func(pc *poolCfg) {
+		pc.hooks = append(pc.hooks, hooks...)
 	}
 }

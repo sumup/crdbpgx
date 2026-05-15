@@ -30,7 +30,9 @@ const (
 
 	// CrdbClockSkewMessage is the error message when CockroachDB nodes have large clock skew.
 	CrdbClockSkewMessage = "cannot specify timestamp in the future"
+)
 
+const (
 	errMsgResettable = "resettable error"
 	errMsgRetryable  = "retryable error"
 )

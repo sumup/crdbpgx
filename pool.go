@@ -11,17 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
-)
-
-var (
-	meter          = otel.Meter("github.com/sumup/crdbpgx")
-	resetHistogram metric.Int64Histogram
-	balancerMeter  *balancerMetrics
 )
 
 // Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with automatic
@@ -41,6 +31,7 @@ type Pool struct {
 	gc          map[*pgx.Conn]struct{}
 
 	ctxPropagation ContextPropagationBehaviour
+	hooks          hookSet
 
 	logger *slog.Logger
 
@@ -79,30 +70,12 @@ func NewPool(
 		return nil, fmt.Errorf("maxRetries must be greater than or equal to 0 (got: %d)", cfg.maxRetries)
 	}
 
-	if resetHistogram == nil {
-		resetHistogram, err = meter.Int64Histogram(
-			"crdbpgx.resets",
-			metric.WithDescription("CockroachDB client-side transaction reset distribution"),
-			metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("initialize crdb client resets histogram: %w", err)
-		}
-	}
-
-	if balancerMeter == nil {
-		balancerMeter, err = newBalancerMetrics()
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// if no custom health tracker was provided we bootstrap one for this
 	// pool automatically
 	healthTracker := cfg.healthTracker
 	var onShutdown []func()
 	if healthTracker == nil {
-		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig)
+		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig, WithNodeHealthHooks(cfg.hooks...))
 		if err != nil {
 			return nil, fmt.Errorf("new node health tracker: %w", err)
 		}
@@ -119,6 +92,7 @@ func NewPool(
 		health:         healthTracker,
 		maxRetries:     cfg.maxRetries,
 		ctxPropagation: cfg.ctxPropagation,
+		hooks:          cfg.hooks,
 		nodeForConn:    make(map[*pgx.Conn]uint32, 0),
 		gc:             make(map[*pgx.Conn]struct{}, 0),
 		logger:         cfg.logger,
@@ -492,11 +466,11 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 	p.debug(ctx, "crdbpgx: acquiring connection from a different node",
 		slog.Uint64("current_node_id", uint64(currentNodeID)),
 	)
-
-	span := trace.SpanFromContext(ctx)
-	span.AddEvent("acquiring connection from different node", trace.WithAttributes(
-		attribute.Int64("current_node_id", int64(currentNodeID)),
-	))
+	p.hooks.acquireFromDifferentNode(ctx, AcquireFromDifferentNodeEvent{
+		PoolName:      p.Name(),
+		CurrentNodeID: currentNodeID,
+		Outcome:       AcquireFromDifferentNodeStarted,
+	})
 
 	for {
 		conn, err := p.pool.Acquire(ctx)
@@ -511,10 +485,11 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			p.debug(ctx, "crdbpgx: only one healthy node available, reuse connection",
 				slog.Uint64("current_node_id", uint64(currentNodeID)),
 			)
-
-			span.AddEvent("only one healthy node available, reuse connection", trace.WithAttributes(
-				attribute.Int64("current_node_id", int64(currentNodeID)),
-			))
+			p.hooks.acquireFromDifferentNode(ctx, AcquireFromDifferentNodeEvent{
+				PoolName:      p.Name(),
+				CurrentNodeID: currentNodeID,
+				Outcome:       AcquireFromDifferentNodeOnlyOneHealthy,
+			})
 			return conn, nil
 		}
 
@@ -527,8 +502,12 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 		p.debug(ctx, "crdbpgx: acquired connection from different node",
 			slog.Uint64("node_id", uint64(id)),
 		)
-
-		span.AddEvent("acquired connection from different node", trace.WithAttributes(attribute.Int64("node_id", int64(id))))
+		p.hooks.acquireFromDifferentNode(ctx, AcquireFromDifferentNodeEvent{
+			PoolName:       p.Name(),
+			CurrentNodeID:  currentNodeID,
+			AcquiredNodeID: id,
+			Outcome:        AcquireFromDifferentNodeDifferentAcquired,
+		})
 		return conn, nil
 	}
 }
@@ -547,13 +526,10 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if conn != nil {
 			conn.Release()
 		}
-		resetHistogram.Record(
-			context.Background(),
-			int64(retries), //nolint:gosec // retries are known to stay within a reasonable range
-			metric.WithAttributes(
-				attribute.String("pool.id", p.Name()),
-			),
-		)
+		p.hooks.retriesComplete(context.Background(), RetriesCompleteEvent{
+			PoolName: p.Name(),
+			Retries:  retries,
+		})
 	}()
 
 	if !RetriesDisabled(ctx) {
