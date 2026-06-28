@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	defaultNodeHealthPollInterval = 5 * time.Second
-	defaultNodeHealthCloseTimeout = 5 * time.Second
+	defaultNodeHealthPollInterval                     = 5 * time.Second
+	defaultTopologyChangeNodeHealthPollInterval       = 5 * time.Second
+	defaultTopologyChangeNodeHealthPollIntervalWindow = 5 * time.Minute
+	defaultNodeHealthCloseTimeout                     = 5 * time.Second
 )
 
 var (
@@ -42,10 +44,16 @@ type nodeHealthTracker struct {
 	nodesSeen    map[uint32]*rate.Limiter
 	newLimiter   func() *rate.Limiter
 	pollInterval time.Duration
+
+	topologyChangePollInterval time.Duration
+	topologyChangePollWindow   time.Duration
+	topologyChangeSubscribers  []chan struct{}
 }
 
 type nodeHealthTrackerConfig struct {
-	pollInterval time.Duration
+	pollInterval               time.Duration
+	topologyChangePollInterval time.Duration
+	topologyChangePollWindow   time.Duration
 }
 
 // NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
@@ -59,33 +67,52 @@ func WithPollInterval(d time.Duration) NodeHealthTrackerOption {
 	}
 }
 
+// WithTopologyChangePollInterval configures a temporary faster polling interval
+// used after the tracker detects a topology change.
+//
+// The faster interval is active for window. Defaults: 5 seconds for 5 minutes.
+func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTrackerOption {
+	return func(tracker *nodeHealthTrackerConfig) {
+		tracker.topologyChangePollInterval = interval
+		tracker.topologyChangePollWindow = window
+	}
+}
+
 // NewNodeHealthTracker creates a new [nodeHealthTracker].
 //
 // The tracker periodically probes for healthy nodes in the CockroachDB cluster
 // and tracks their health.
 func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) (_ *nodeHealthTracker, err error) {
+	metricsMu.Lock()
 	if healthyCRDBNodeCountGauge == nil {
 		healthyCRDBNodeCountGauge, err = meter.Int64Gauge(
 			"crdb_healthy_nodes",
 			metric.WithDescription("Number of health CRDB nodes detected"),
 		)
 		if err != nil {
+			metricsMu.Unlock()
 			return nil, fmt.Errorf("initialize crdb health nodes gauge: %w", err)
 		}
 	}
+	metricsMu.Unlock()
 
 	tCfg := &nodeHealthTrackerConfig{
-		pollInterval: defaultNodeHealthPollInterval,
+		pollInterval:               defaultNodeHealthPollInterval,
+		topologyChangePollInterval: defaultTopologyChangeNodeHealthPollInterval,
+		topologyChangePollWindow:   defaultTopologyChangeNodeHealthPollIntervalWindow,
 	}
 	for _, o := range opts {
 		o(tCfg)
 	}
 
 	return &nodeHealthTracker{
-		connConfig:   cfg,
-		pollInterval: tCfg.pollInterval,
-		healthyNodes: make(map[uint32]struct{}),
-		nodesSeen:    make(map[uint32]*rate.Limiter),
+		connConfig:                 cfg,
+		pollInterval:               tCfg.pollInterval,
+		topologyChangePollInterval: tCfg.topologyChangePollInterval,
+		topologyChangePollWindow:   tCfg.topologyChangePollWindow,
+		healthyNodes:               make(map[uint32]struct{}),
+		nodesSeen:                  make(map[uint32]*rate.Limiter),
+		topologyChangeSubscribers:  make([]chan struct{}, 0),
 		newLimiter: func() *rate.Limiter {
 			return rate.NewLimiter(rate.Every(1*time.Minute), 2)
 		},
@@ -100,20 +127,26 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 //
 // This should be run in a goroutine. It will run until the context is canceled.
 func (t *nodeHealthTracker) Poll(ctx context.Context) {
-	ticker := NewJitteredTicker(t.pollInterval, &UniformJitter{
+	topologyChanges := t.SubscribeTopologyChanges()
+	jitter := UniformJitter{
 		//nolint:gosec // We use unsecure rand here in an acceptable way.
-		Source: rand.New(rand.NewSource(time.Now().Unix())),
-		// To avoid checking all nodes at the same time with concurrent startup, we apply a jitter.
-		// This should be 20% of the interval, but not longer than a second.
-		Min: min(t.pollInterval/5, 1*time.Second),
-	})
-	defer ticker.Stop()
+		Source: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	var acceleratedUntil time.Time
+
 	for {
+		interval := t.currentPollInterval(time.Now(), acceleratedUntil)
+		timer := time.NewTimer(jitteredPollInterval(interval, jitter))
+
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			t.tryConnection(ctx, t.pollInterval)
+		case <-topologyChanges:
+			timer.Stop()
+			acceleratedUntil = time.Now().Add(t.topologyChangePollWindow)
+		case <-timer.C:
+			t.tryConnection(ctx, interval)
 		}
 	}
 }
@@ -152,11 +185,6 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 // to prevent marking nodes as unhealthy due to transient errors).
 func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	t.mu.Lock()
-	defer func() {
-		numHealthy := len(t.healthyNodes)
-		t.mu.Unlock()
-		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
-	}()
 
 	nodeLimiter, nodeHasBeenSeen := t.nodesSeen[nodeID]
 	if !nodeHasBeenSeen {
@@ -165,18 +193,37 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	}
 
 	if healthy {
+		_, wasHealthy := t.healthyNodes[nodeID]
+		hadHealthyNodes := len(t.healthyNodes) > 0
 		t.healthyNodes[nodeID] = struct{}{}
 		t.nodesSeen[nodeID] = t.newLimiter()
+		numHealthy := len(t.healthyNodes)
+		t.mu.Unlock()
+		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
+		if !wasHealthy && hadHealthyNodes {
+			t.notifyTopologyChange()
+		}
 		return
 	}
 
 	// If the limiter allows the request, we haven't seen more than 2 failures in the past minute.
 	// Keep the node health
 	if nodeLimiter.Allow() {
+		numHealthy := len(t.healthyNodes)
+		t.mu.Unlock()
+		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
 		return
 	}
 
+	_, wasHealthy := t.healthyNodes[nodeID]
 	delete(t.healthyNodes, nodeID)
+	numHealthy := len(t.healthyNodes)
+	t.mu.Unlock()
+
+	healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
+	if wasHealthy {
+		t.notifyTopologyChange()
+	}
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.
@@ -192,4 +239,48 @@ func (t *nodeHealthTracker) NumHealthy() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.healthyNodes)
+}
+
+func (t *nodeHealthTracker) SubscribeTopologyChanges() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.topologyChangeSubscribers = append(t.topologyChangeSubscribers, ch)
+
+	return ch
+}
+
+func (t *nodeHealthTracker) notifyTopologyChange() {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	for _, ch := range t.topologyChangeSubscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (t *nodeHealthTracker) currentPollInterval(now, acceleratedUntil time.Time) time.Duration {
+	if t.topologyChangePollWindow > 0 && now.Before(acceleratedUntil) {
+		return t.topologyChangePollInterval
+	}
+	return t.pollInterval
+}
+
+func jitteredPollInterval(interval time.Duration, jitter UniformJitter) time.Duration {
+	// To avoid checking all nodes at the same time with concurrent startup, we apply a jitter.
+	// This should be 20% of the interval, but not longer than a second.
+	minJitter := min(interval/5, time.Second)
+	if minJitter <= 0 {
+		minJitter = time.Nanosecond
+	}
+	if interval <= minJitter {
+		return interval
+	}
+
+	jitter.Min = minJitter
+	return jitter.Jitter(interval)
 }

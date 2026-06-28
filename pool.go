@@ -19,6 +19,7 @@ import (
 )
 
 var (
+	metricsMu      sync.Mutex
 	meter          = otel.Meter("github.com/sumup/crdbpgx")
 	resetHistogram metric.Int64Histogram
 	balancerMeter  *balancerMetrics
@@ -82,6 +83,7 @@ func NewPool(
 		return nil, fmt.Errorf("maxRetries must be greater than or equal to 0 (got: %d)", cfg.maxRetries)
 	}
 
+	metricsMu.Lock()
 	if resetHistogram == nil {
 		resetHistogram, err = meter.Int64Histogram(
 			"crdbpgx.resets",
@@ -89,6 +91,7 @@ func NewPool(
 			metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
 		)
 		if err != nil {
+			metricsMu.Unlock()
 			return nil, fmt.Errorf("initialize crdb client resets histogram: %w", err)
 		}
 	}
@@ -96,9 +99,11 @@ func NewPool(
 	if balancerMeter == nil {
 		balancerMeter, err = newBalancerMetrics()
 		if err != nil {
+			metricsMu.Unlock()
 			return nil, err
 		}
 	}
+	metricsMu.Unlock()
 
 	// if no custom health tracker was provided we bootstrap one for this
 	// pool automatically

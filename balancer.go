@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	defaultBalancingInterval = 30 * time.Second
-	defaultBalancingTimeout  = 10 * time.Second
+	defaultBalancingInterval                     = 30 * time.Second
+	defaultTopologyChangeBalancingInterval       = 5 * time.Second
+	defaultTopologyChangeBalancingIntervalWindow = 5 * time.Minute
+	defaultBalancingTimeout                      = 10 * time.Second
 )
 
 type balancerMetrics struct {
@@ -59,10 +61,14 @@ type NodeBalancer interface {
 // nodeConnectionBalancer distributes database connections across CockroachDB nodes,
 // rebalancing periodically to maintain even distribution and handle node health changes.
 type nodeConnectionBalancer struct {
-	mu             *sync.Mutex
-	ticker         *time.Ticker
-	balanceTimeout time.Duration
-	logger         *slog.Logger
+	mu                            *sync.Mutex
+	ticker                        *time.Ticker
+	balancingInterval             time.Duration
+	topologyChangeBalanceInterval time.Duration
+	topologyChangeBalanceWindow   time.Duration
+	balanceTimeout                time.Duration
+	logger                        *slog.Logger
+	rebalance                     func(context.Context, *Pool)
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that distributes
@@ -78,11 +84,15 @@ type nodeConnectionBalancer struct {
 // If no interval is specified via [WithBalancingInterval], the default is 30 seconds.
 func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalancer {
 	nb := &nodeConnectionBalancer{
-		mu:             new(sync.Mutex),
-		ticker:         time.NewTicker(defaultBalancingInterval),
-		balanceTimeout: defaultBalancingTimeout,
-		logger:         slog.Default(),
+		mu:                            new(sync.Mutex),
+		ticker:                        time.NewTicker(defaultBalancingInterval),
+		balanceTimeout:                defaultBalancingTimeout,
+		logger:                        slog.Default(),
+		balancingInterval:             defaultBalancingInterval,
+		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
+		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
 	}
+	nb.rebalance = nb.rebalancePool
 
 	for _, opt := range opts {
 		opt(nb)
@@ -98,7 +108,19 @@ type NodeConnectionBalancerOption func(*nodeConnectionBalancer)
 // Default: 30 seconds.
 func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOption {
 	return func(b *nodeConnectionBalancer) {
+		b.balancingInterval = interval
 		b.ticker.Reset(interval)
+	}
+}
+
+// WithTopologyChangeBalancingInterval configures a temporary faster balancing
+// interval used after the tracker detects a topology change.
+//
+// The faster interval is active for window. Defaults: 5 seconds for 5 minutes.
+func WithTopologyChangeBalancingInterval(interval, window time.Duration) NodeConnectionBalancerOption {
+	return func(b *nodeConnectionBalancer) {
+		b.topologyChangeBalanceInterval = interval
+		b.topologyChangeBalanceWindow = window
 	}
 }
 
@@ -119,18 +141,30 @@ func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 	defer p.ticker.Stop()
 
+	topologyChanges := topologyChangeEvents(pool.health)
+	var acceleratedUntil time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-topologyChanges:
+			acceleratedUntil = time.Now().Add(p.topologyChangeBalanceWindow)
+			p.ticker.Reset(p.currentBalancingInterval(time.Now(), acceleratedUntil))
+			p.rebalance(ctx, pool)
 		case <-p.ticker.C:
-			p.Rebalance(ctx, pool)
+			p.rebalance(ctx, pool)
+			p.ticker.Reset(p.currentBalancingInterval(time.Now(), acceleratedUntil))
 		}
 	}
 }
 
 // Rebalance performs one balancing operation.
 func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
+	p.rebalance(ctx, pool)
+}
+
+func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -226,4 +260,23 @@ func maxConnsPerNode(maxConns, nodeCount int) int {
 	}
 
 	return nodeMax
+}
+
+func (p *nodeConnectionBalancer) currentBalancingInterval(now, acceleratedUntil time.Time) time.Duration {
+	if p.topologyChangeBalanceWindow > 0 && now.Before(acceleratedUntil) {
+		return p.topologyChangeBalanceInterval
+	}
+	return p.balancingInterval
+}
+
+type topologyChangeSubscriber interface {
+	SubscribeTopologyChanges() <-chan struct{}
+}
+
+func topologyChangeEvents(health NodeHealthTracker) <-chan struct{} {
+	subscriber, ok := health.(topologyChangeSubscriber)
+	if !ok {
+		return nil
+	}
+	return subscriber.SubscribeTopologyChanges()
 }
