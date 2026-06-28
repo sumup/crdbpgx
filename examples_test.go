@@ -32,11 +32,7 @@ func ExampleNewPool() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = pool.Close(shutdownCtx)
-	}()
+	defer pool.Close()
 }
 
 func ExamplePool_InTx() {

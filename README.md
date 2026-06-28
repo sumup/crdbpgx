@@ -53,11 +53,7 @@ func main() {
   if err != nil {
     panic(fmt.Errorf("create read pool: %w", err))
   }
-  defer func() {
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    _ = pool.Close(shutdownCtx)
-  }()
+  defer pool.Close()
 
   // use your pool
 }
@@ -79,7 +75,7 @@ The health tracker is owned by the pool as they are coupled closely together but
 
 ### Node Connection Balancer
 
-Node connection balancer periodically acquires idle connections from the pool and prunes connections that make the distribution across healthy nodes uneven. Configure it with `WithBalancer(crdbpgx.NewNodeConnectionBalancer(...))` when creating a pool. The pool starts the balancer loop with pool-owned lifecycle context and stops it on `Close(ctx)`.
+Node connection balancer periodically acquires idle connections from the pool and prunes connections that make the distribution across healthy nodes uneven. Configure it with `WithBalancer(crdbpgx.NewNodeConnectionBalancer(...))` when creating a pool. The pool starts the balancer loop with pool-owned lifecycle context and stops it on `Close()`.
 
 If you need manual lifecycle control, create a balancer with `NewNodeConnectionBalancer`, call `Run(ctx, pool)` in your own goroutine for the periodic loop, or call `Rebalance(ctx, pool)` to perform a single balancing operation.
 

@@ -19,18 +19,12 @@
 // and the optional node connection balancer, is owned by the Pool and is stopped
 // by [Pool.Close].
 //
-// Always close the pool with a bounded shutdown context:
+// Always close the pool when it is no longer needed:
 //
-//	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-//	defer cancel()
-//	if err := pool.Close(shutdownCtx); err != nil {
-//		// Shutdown did not finish before shutdownCtx was canceled or expired.
-//	}
+//	defer pool.Close()
 //
 // [Pool.Close] starts shutdown once and waits for internal goroutines and the
-// underlying pgx pool to finish closing. If the supplied context is canceled
-// first, Close returns that context error while shutdown continues in the
-// background.
+// underlying pgx pool to finish closing.
 //
 // # Context propagation
 //
@@ -65,11 +59,7 @@
 //	if err != nil {
 //		return fmt.Errorf("create pool: %w", err)
 //	}
-//	defer func() {
-//		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-//		defer cancel()
-//		_ = pool.Close(shutdownCtx)
-//	}()
+//	defer pool.Close()
 //
 // # Example: run a transaction with automatic retries
 //

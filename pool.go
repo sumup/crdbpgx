@@ -48,7 +48,6 @@ type Pool struct {
 	onShutdown []func()
 	shutdownWG *sync.WaitGroup
 	closeOnce  sync.Once
-	closeDone  chan struct{}
 }
 
 var (
@@ -133,7 +132,6 @@ func NewPool(
 		logger:         cfg.logger,
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
-		closeDone:      make(chan struct{}),
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
@@ -386,32 +384,15 @@ var (
 )
 
 // Close closes all connections in the pool and prevents new connections from being acquired.
-func (p *Pool) Close(ctx context.Context) error {
+func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
-		go func() {
-			defer close(p.closeDone)
+		for _, callback := range p.onShutdown {
+			callback()
+		}
 
-			for _, callback := range p.onShutdown {
-				callback()
-			}
-
-			poolClosed := make(chan struct{})
-			go func() {
-				defer close(poolClosed)
-				p.pool.Close()
-			}()
-
-			p.shutdownWG.Wait()
-			<-poolClosed
-		}()
+		p.pool.Close()
+		p.shutdownWG.Wait()
 	})
-
-	select {
-	case <-p.closeDone:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // Config returns a copy of the pool's configuration.

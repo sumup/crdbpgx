@@ -70,7 +70,7 @@ func TestPool_Close(t *testing.T) {
 		}
 
 		close(balancer.release)
-		require.NoError(t, pool.Close(context.Background()))
+		pool.Close()
 
 		require.Eventually(t, func() bool {
 			select {
@@ -82,7 +82,7 @@ func TestPool_Close(t *testing.T) {
 		}, time.Second, 10*time.Millisecond)
 	})
 
-	t.Run("close cancelation", func(t *testing.T) {
+	t.Run("idempotent", func(t *testing.T) {
 		t.Parallel()
 
 		cfg, err := pgxpool.ParseConfig("postgres://user:password@127.0.0.1:1/db?pool_min_conns=0&pool_min_idle_conns=0")
@@ -98,12 +98,8 @@ func TestPool_Close(t *testing.T) {
 		require.NoError(t, err)
 		<-balancer.started
 
-		closeCtx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		require.ErrorIs(t, pool.Close(closeCtx), context.Canceled)
-
 		close(balancer.release)
-		require.NoError(t, pool.Close(context.Background()))
+		pool.Close()
+		pool.Close()
 	})
 }
