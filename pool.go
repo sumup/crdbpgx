@@ -24,12 +24,13 @@ var (
 	balancerMeter  *balancerMetrics
 )
 
-// Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with automatic
-// retry logic, node health tracking, and connection rebalancing capabilities.
+// Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with
+// automatic retry logic, node health tracking, and optional connection
+// rebalancing capabilities.
 //
 // Pool provides the same interface as [pgxpool.Pool] but adds resilience features
 // specifically designed for CockroachDB clusters, including automatic handling of
-// retryable and resettable errors, and intelligent connection management across nodes.
+// retryable and resettable errors, and optional connection management across nodes.
 type Pool struct {
 	pool   *pgxpool.Pool
 	name   string
@@ -45,6 +46,9 @@ type Pool struct {
 	logger *slog.Logger
 
 	onShutdown []func()
+	shutdownWG *sync.WaitGroup
+	closeOnce  sync.Once
+	closeDone  chan struct{}
 }
 
 var (
@@ -54,7 +58,7 @@ var (
 // NewPool creates a new CockroachDB-aware connection pool.
 //
 // The pool wraps [pgxpool.Pool] and adds CockroachDB-specific features including
-// automatic retry logic, node health tracking, and connection rebalancing.
+// automatic retry logic, node health tracking, and optional connection rebalancing.
 //
 // Parameters:
 //   - ctx: Context for pool initialization
@@ -101,6 +105,7 @@ func NewPool(
 	// pool automatically
 	healthTracker := cfg.healthTracker
 	var onShutdown []func()
+	shutdownWG := new(sync.WaitGroup)
 	if healthTracker == nil {
 		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig)
 		if err != nil {
@@ -108,7 +113,11 @@ func NewPool(
 		}
 
 		healthTrackerCtx, cancel := context.WithCancel(context.Background())
-		go nodeHealthTracker.Poll(healthTrackerCtx)
+		shutdownWG.Add(1)
+		go func() {
+			defer shutdownWG.Done()
+			nodeHealthTracker.Poll(healthTrackerCtx)
+		}()
 
 		healthTracker = nodeHealthTracker
 		onShutdown = append(onShutdown, cancel)
@@ -123,6 +132,8 @@ func NewPool(
 		gc:             make(map[*pgx.Conn]struct{}, 0),
 		logger:         cfg.logger,
 		onShutdown:     onShutdown,
+		shutdownWG:     shutdownWG,
+		closeDone:      make(chan struct{}),
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
@@ -213,8 +224,23 @@ func NewPool(
 	// Finally, we create the actual connection pool
 	p.pool, err = pgxpool.NewWithConfig(ctx, pgxConfig)
 	if err != nil {
+		for _, callback := range p.onShutdown {
+			callback()
+		}
+		p.shutdownWG.Wait()
 		return nil, fmt.Errorf("create crdbpgx.Pool from config: %w", err)
 	}
+
+	if cfg.balancer != nil {
+		balancerCtx, cancel := context.WithCancel(context.Background())
+		p.shutdownWG.Add(1)
+		go func() {
+			defer p.shutdownWG.Done()
+			cfg.balancer.Run(balancerCtx, p)
+		}()
+		p.onShutdown = append(p.onShutdown, cancel)
+	}
+
 	return p, nil
 }
 
@@ -241,7 +267,7 @@ func (p *Pool) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
 }
 
 // AcquireAllIdle atomically acquires all currently idle connections from the pool.
-// This is primarily used by the connection rebalancer.
+// This is primarily used by the node connection balancer.
 func (p *Pool) AcquireAllIdle(ctx context.Context) []*pgxpool.Conn {
 	ctx = p.contextForAcquire(ctx)
 	return p.pool.AcquireAllIdle(ctx)
@@ -360,11 +386,32 @@ var (
 )
 
 // Close closes all connections in the pool and prevents new connections from being acquired.
-func (p *Pool) Close() {
-	for _, callback := range p.onShutdown {
-		callback()
+func (p *Pool) Close(ctx context.Context) error {
+	p.closeOnce.Do(func() {
+		go func() {
+			defer close(p.closeDone)
+
+			for _, callback := range p.onShutdown {
+				callback()
+			}
+
+			poolClosed := make(chan struct{})
+			go func() {
+				defer close(poolClosed)
+				p.pool.Close()
+			}()
+
+			p.shutdownWG.Wait()
+			<-poolClosed
+		}()
+	})
+
+	select {
+	case <-p.closeDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	p.pool.Close()
 }
 
 // Config returns a copy of the pool's configuration.

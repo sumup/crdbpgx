@@ -12,7 +12,7 @@ on:
       - main
 
 env:
-  GOLANGCI_LINT_VERSION: v2.5.0
+  GOLANGCI_LINT_VERSION: v2.12.2
 
 permissions:
   contents: write
@@ -40,8 +40,8 @@ jobs:
     strategy:
       matrix:
         go:
-          - "1.24" # stable-1
-          - "stable" # 1.25
+          - "1.25" # stable-1
+          - "stable" # 1.26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 

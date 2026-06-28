@@ -21,9 +21,11 @@ Inspired by AuthZed's [Maximizing CockroachDB Performance: Our Journey to 1 Mill
 package main
 
 import (
+  "context"
+  "fmt"
   "os"
   "os/signal"
-  "fmt"
+  "time"
 
   "github.com/jackc/pgx/v5/pgxpool"
   "github.com/sumup/crdbpgx"
@@ -39,14 +41,23 @@ func main() {
     panic(fmt.Errorf("parse dsn: %w", err))
   }
 
-  pool, err = crdbpgx.NewPool(
-    ctx, // application context that the pool life-time is tied to
+  pool, err := crdbpgx.NewPool(
+    ctx, // context used only while the pool is created
     cfg,
     crdbpgx.WithContextPropagationBehaviour(crdbpgx.ContextPropagationOnAcquire),
+    crdbpgx.WithBalancer(crdbpgx.NewNodeConnectionBalancer(
+      crdbpgx.WithBalancingInterval(30*time.Second),
+      crdbpgx.WithBalancingTimeout(10*time.Second),
+    )),
   )
   if err != nil {
     panic(fmt.Errorf("create read pool: %w", err))
   }
+  defer func() {
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    _ = pool.Close(shutdownCtx)
+  }()
 
   // use your pool
 }
@@ -54,21 +65,23 @@ func main() {
 
 ## Components
 
-There are free main components of `crdbpgx`:
+There are three main components of `crdbpgx`:
 
 ### Pool
 
-The database connection pool which is a thin wrapper around `pgxpool` adjusted to CockroachDB that transparently retries retryable errors.
+The database connection pool is a thin wrapper around `pgxpool` adjusted to CockroachDB that transparently retries retryable errors. Optional features, such as the node connection balancer, are configured with `NewPool` options.
 
-### Node health tracker
+### Node Health Tracker
 
 Tracks health of nodes in the cluster. This is done in two ways - when executing queries and in a periodical polling loop. In queries, nodes are marked as unhealthy if they fail with a resettable error (i.e. errors that are not a result of a database operation but rather of the underlying connection). The polling mechanism then periodically pings a random node in the cluster and if a node comes back to live or a new node is added their health is tracked as healthy.
 
 The health tracker is owned by the pool as they are coupled closely together but users of this package are free to provide their own implementation of the node health tracker.
 
-### Node connection balancer
+### Node Connection Balancer
 
-Node connection balancer wraps the connection pool with rebalancing functionality. At a specified period the balancer acquires idle connections from the pool and prunes those, that are making the connection distribution among nodes uneven. The balancer functionality ensures that the load is evenly distributed among the nodes in the cluster even during upgrades where nodes drain and come back online or when the cluster is scaled.
+Node connection balancer periodically acquires idle connections from the pool and prunes connections that make the distribution across healthy nodes uneven. Configure it with `WithBalancer(crdbpgx.NewNodeConnectionBalancer(...))` when creating a pool. The pool starts the balancer loop with pool-owned lifecycle context and stops it on `Close(ctx)`.
+
+If you need manual lifecycle control, create a balancer with `NewNodeConnectionBalancer`, call `Run(ctx, pool)` in your own goroutine for the periodic loop, or call `Rebalance(ctx, pool)` to perform a single balancing operation.
 
 ## Credits
 
