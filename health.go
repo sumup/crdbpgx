@@ -15,6 +15,7 @@ import (
 
 const (
 	defaultNodeHealthPollInterval = 5 * time.Second
+	defaultNodeHealthCloseTimeout = 5 * time.Second
 )
 
 var (
@@ -110,6 +111,7 @@ func (t *nodeHealthTracker) Poll(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			t.tryConnection(ctx, t.pollInterval)
 		}
@@ -125,7 +127,9 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 		return
 	}
 	defer func() {
-		_ = conn.Close(ctx)
+		closeCtx, cancel := context.WithTimeout(context.Background(), defaultNodeHealthCloseTimeout)
+		defer cancel()
+		_ = conn.Close(closeCtx)
 	}()
 
 	if err := conn.Ping(ctx); err != nil {

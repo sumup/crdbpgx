@@ -51,37 +51,39 @@ func newBalancerMetrics() (b *balancerMetrics, err error) {
 	return b, nil
 }
 
+// NodeBalancer balances pooled connections across CockroachDB nodes.
+type NodeBalancer interface {
+	// Run starts the periodic balancing loop and blocks until ctx is canceled.
+	Run(ctx context.Context, pool *Pool)
+	// Rebalance performs one balancing operation.
+	Rebalance(ctx context.Context, pool *Pool)
+}
+
 // nodeConnectionBalancer distributes database connections across CockroachDB nodes,
 // rebalancing periodically to maintain even distribution and handle node health changes.
 type nodeConnectionBalancer struct {
-	ticker         *time.Ticker
 	mu             *sync.Mutex
-	pool           *Pool
+	ticker         *time.Ticker
 	balanceTimeout time.Duration
 	rnd            *rand.Rand
 	logger         *slog.Logger
 }
 
-// NewNodeConnectionBalancer creates a connection balancer that rebalances connections
-// across CockroachDB nodes at the specified interval.
+// NewNodeConnectionBalancer creates a connection balancer that distributes
+// connections across CockroachDB nodes.
 //
 // The balancer ensures an even distribution of connections across healthy nodes,
 // pruning excess connections from over-utilized nodes and marking unhealthy
 // node connections for garbage collection.
 //
-// Parameters:
-//   - pool: The connection pool to balance
-//   - opts: Optional configuration (see [NodeConnectionBalancerOption])
+// Pass the returned balancer to [WithBalancer] to run it with a [Pool], or call
+// [NodeBalancer.Run] yourself if you need to manage its lifecycle directly.
 //
 // If no interval is specified via [WithBalancingInterval], the default is 30 seconds.
-func NewNodeConnectionBalancer(
-	pool *Pool,
-	opts ...NodeConnectionBalancerOption,
-) *nodeConnectionBalancer {
+func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalancer {
 	nb := &nodeConnectionBalancer{
 		mu:             new(sync.Mutex),
 		ticker:         time.NewTicker(defaultBalancingInterval),
-		pool:           pool,
 		balanceTimeout: defaultBalancingTimeout,
 		//nolint:gosec // weak random is fine here
 		rnd:    rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
@@ -114,30 +116,34 @@ func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 	}
 }
 
-// Rebalance continuously rebalances connections at the configured interval.
+// Run continuously rebalances connections at the configured interval.
 //
 // This should be run in a goroutine. It will run until the context is canceled.
 // During each rebalancing cycle, it acquires all idle connections, calculates
 // the optimal distribution across healthy nodes, and marks excess connections
 // for garbage collection.
-func (p *nodeConnectionBalancer) Rebalance(ctx context.Context) {
+func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
+	defer p.ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			p.ticker.Stop()
+			return
 		case <-p.ticker.C:
-			if p.mu.TryLock() {
-				ctx, cancel := context.WithTimeout(ctx, p.balanceTimeout)
-				p.rebalance(ctx)
-				cancel()
-				p.mu.Unlock()
-			}
+			p.Rebalance(ctx, pool)
 		}
 	}
 }
 
-func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
-	conns := p.pool.AcquireAllIdle(ctx)
+// Rebalance performs one balancing operation.
+func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, p.balanceTimeout)
+	defer cancel()
+
+	conns := pool.AcquireAllIdle(ctx)
 	defer func() {
 		// Release all acquired idle connections
 		for _, c := range conns {
@@ -146,33 +152,33 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 	}()
 	balancerMeter.acquireHist.Record(ctx, int64(len(conns)),
 		metric.WithAttributes(
-			attribute.String("pool.id", p.pool.Name()),
+			attribute.String("pool.id", pool.Name()),
 		),
 	)
 
-	nodeCount := max(p.pool.health.NumHealthy(), 1)
+	nodeCount := max(pool.health.NumHealthy(), 1)
 
 	healthyConns := make(map[uint32][]*pgxpool.Conn, nodeCount)
 	for _, c := range conns {
 		nid := nodeID(c.Conn())
-		if p.pool.health.IsHealthy(nid) {
+		if pool.health.IsHealthy(nid) {
 			if healthyConns[nid] == nil {
 				healthyConns[nid] = make([]*pgxpool.Conn, 0, min(1, len(conns)/nodeCount))
 			}
 			healthyConns[nid] = append(healthyConns[nid], c)
 		} else {
-			p.pool.GCMark(c.Conn())
+			pool.GCMark(c.Conn())
 		}
 	}
 
 	// Shuffle node pruning order
-	connsPerNode := p.pool.connsPerNode()
+	connsPerNode := pool.connsPerNode()
 	nodes := slices.Collect(maps.Keys(connsPerNode))
 	p.rnd.Shuffle(len(nodes), func(i, j int) {
 		nodes[j], nodes[i] = nodes[i], nodes[j]
 	})
 
-	maxConns := p.pool.MaxConns()
+	maxConns := pool.MaxConns()
 	perNodeMax := maxConns / nodeCount
 
 	var prunedTotal int64
@@ -181,7 +187,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		cnt := connsPerNode[nodeID]
 		nodeMax := perNodeMax
 
-		if p.pool.health.NumHealthy() == 0 || i < maxConns%p.pool.health.NumHealthy() {
+		if pool.health.NumHealthy() == 0 || i < maxConns%pool.health.NumHealthy() {
 			perNodeMax++
 		}
 
@@ -197,7 +203,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 		}
 
 		for _, c := range healthyConns[nodeID][:toPrune] {
-			p.pool.GCMark(c.Conn())
+			pool.GCMark(c.Conn())
 		}
 
 		prunedTotal += int64(toPrune)
@@ -205,9 +211,9 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 			ctx,
 			"balancer: pruned connections",
 			slog.String("library", "github.com/sumup/crdbpgx"),
-			slog.String("pool", p.pool.Name()),
+			slog.String("pool", pool.Name()),
 			slog.Uint64("node_id", uint64(nodeID)),
-			slog.Int64("pool_max_conns", int64(p.pool.Config().MaxConns)),
+			slog.Int64("pool_max_conns", int64(pool.Config().MaxConns)),
 			slog.Int64("node_conns", int64(cnt)),
 			slog.Int64("node_max_conns", int64(nodeMax)),
 			slog.Int("node_pruned_conns", toPrune),
@@ -216,7 +222,7 @@ func (p *nodeConnectionBalancer) rebalance(ctx context.Context) {
 
 	balancerMeter.pruneHist.Record(ctx, prunedTotal,
 		metric.WithAttributes(
-			attribute.String("pool.id", p.pool.Name()),
+			attribute.String("pool.id", pool.Name()),
 		),
 	)
 }

@@ -24,6 +24,7 @@ type poolCfg struct {
 	ctxPropagation ContextPropagationBehaviour
 	logger         *slog.Logger
 	healthTracker  NodeHealthTracker
+	balancer       NodeBalancer
 }
 
 func defaultPoolCfg() *poolCfg {
@@ -79,15 +80,26 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithHealthTracker configures the health tracker used by the pool.
+// WithHealthTracker configures the health tracker used by the [Pool].
 //
 // You might want to initialize and pass the health tracker to the pool
 // yourself if you use multiple pools for the same database inside one
 // application in which case the pools can share the health tracker.
 //
 // If no custom health tracker is provided a default per-pool one is used.
-func WithHealthTracker(h *nodeHealthTracker) Option {
+func WithHealthTracker(h NodeHealthTracker) Option {
 	return func(pc *poolCfg) {
 		pc.healthTracker = h
+	}
+}
+
+// WithBalancer configures the node connection balancer used by the [Pool].
+//
+// The pool starts the balancer after the underlying pgx pool is created
+// and stops it when [Pool.Close] is called. If no balancer is configured,
+// connection rebalancing is disabled.
+func WithBalancer(b NodeBalancer) Option {
+	return func(pc *poolCfg) {
+		pc.balancer = b
 	}
 }
