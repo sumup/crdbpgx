@@ -4,9 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"maps"
-	"math/rand/v2"
-	"slices"
 	"sync"
 	"time"
 
@@ -65,7 +62,6 @@ type nodeConnectionBalancer struct {
 	mu             *sync.Mutex
 	ticker         *time.Ticker
 	balanceTimeout time.Duration
-	rnd            *rand.Rand
 	logger         *slog.Logger
 }
 
@@ -85,9 +81,7 @@ func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalance
 		mu:             new(sync.Mutex),
 		ticker:         time.NewTicker(defaultBalancingInterval),
 		balanceTimeout: defaultBalancingTimeout,
-		//nolint:gosec // weak random is fine here
-		rnd:    rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
-		logger: slog.Default(),
+		logger:         slog.Default(),
 	}
 
 	for _, opt := range opts {
@@ -171,26 +165,14 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 		}
 	}
 
-	// Shuffle node pruning order
 	connsPerNode := pool.connsPerNode()
-	nodes := slices.Collect(maps.Keys(connsPerNode))
-	p.rnd.Shuffle(len(nodes), func(i, j int) {
-		nodes[j], nodes[i] = nodes[i], nodes[j]
-	})
 
 	maxConns := pool.MaxConns()
-	perNodeMax := maxConns / nodeCount
+	nodeMax := maxConnsPerNode(maxConns, nodeCount)
 
 	var prunedTotal int64
 
-	for i, nodeID := range nodes {
-		cnt := connsPerNode[nodeID]
-		nodeMax := perNodeMax
-
-		if pool.health.NumHealthy() == 0 || i < maxConns%pool.health.NumHealthy() {
-			perNodeMax++
-		}
-
+	for nodeID, cnt := range connsPerNode {
 		toPrune := cnt - nodeMax
 		if toPrune <= 0 {
 			continue
@@ -225,4 +207,23 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 			attribute.String("pool.id", pool.Name()),
 		),
 	)
+}
+
+// maxConnsPerNode returns the maximum number of connections per pod
+// given the size of the pool and number of nodes.
+//
+// maxConnsPerNode rounds up to ensure we always saturate the pool.
+// E.g. a pool with size 10 and a cluster with 3 nodes results in
+// the maximum number of connections per node to be 4.
+func maxConnsPerNode(maxConns, nodeCount int) int {
+	if nodeCount <= 0 {
+		return maxConns
+	}
+
+	nodeMax := maxConns / nodeCount
+	if maxConns%nodeCount > 0 {
+		nodeMax++
+	}
+
+	return nodeMax
 }
