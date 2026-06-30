@@ -21,8 +21,26 @@ const (
 )
 
 var (
-	healthyCRDBNodeCountGauge metric.Int64Gauge
+	newNodeHealthTrackerMetricsOnce = sync.OnceValue(newNodeHealthTrackerMetrics)
 )
+
+type healthTrackerMetrics struct {
+	healthyNodesGauge metric.Int64Gauge
+}
+
+func newNodeHealthTrackerMetrics() *healthTrackerMetrics {
+	healthyCRDBNodeCountGauge, err := meter.Int64Gauge(
+		"crdb_healthy_nodes",
+		metric.WithDescription("Number of health CRDB nodes detected"),
+	)
+	if err != nil {
+		panic(fmt.Errorf("initialize crdb health nodes gauge: %w", err))
+	}
+
+	return &healthTrackerMetrics{
+		healthyNodesGauge: healthyCRDBNodeCountGauge,
+	}
+}
 
 // NodeHealthTracker is responsible for tracking health of a nodes
 // in a CockroachDB cluster.
@@ -44,6 +62,7 @@ type nodeHealthTracker struct {
 	nodesSeen    map[uint32]*rate.Limiter
 	newLimiter   func() *rate.Limiter
 	pollInterval time.Duration
+	metrics      *healthTrackerMetrics
 
 	topologyChangePollInterval time.Duration
 	topologyChangePollWindow   time.Duration
@@ -83,19 +102,6 @@ func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTr
 // The tracker periodically probes for healthy nodes in the CockroachDB cluster
 // and tracks their health.
 func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) (_ *nodeHealthTracker, err error) {
-	metricsMu.Lock()
-	if healthyCRDBNodeCountGauge == nil {
-		healthyCRDBNodeCountGauge, err = meter.Int64Gauge(
-			"crdb_healthy_nodes",
-			metric.WithDescription("Number of health CRDB nodes detected"),
-		)
-		if err != nil {
-			metricsMu.Unlock()
-			return nil, fmt.Errorf("initialize crdb health nodes gauge: %w", err)
-		}
-	}
-	metricsMu.Unlock()
-
 	tCfg := &nodeHealthTrackerConfig{
 		pollInterval:               defaultNodeHealthPollInterval,
 		topologyChangePollInterval: defaultTopologyChangeNodeHealthPollInterval,
@@ -112,6 +118,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		topologyChangePollWindow:   tCfg.topologyChangePollWindow,
 		healthyNodes:               make(map[uint32]struct{}),
 		nodesSeen:                  make(map[uint32]*rate.Limiter),
+		metrics:                    newNodeHealthTrackerMetricsOnce(),
 		topologyChangeSubscribers:  make([]chan struct{}, 0),
 		newLimiter: func() *rate.Limiter {
 			return rate.NewLimiter(rate.Every(1*time.Minute), 2)
@@ -199,7 +206,7 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 		t.nodesSeen[nodeID] = t.newLimiter()
 		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
+		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
 		if !wasHealthy && hadHealthyNodes {
 			t.notifyTopologyChange()
 		}
@@ -211,7 +218,7 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	if nodeLimiter.Allow() {
 		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
+		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
 		return
 	}
 
@@ -220,7 +227,7 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	numHealthy := len(t.healthyNodes)
 	t.mu.Unlock()
 
-	healthyCRDBNodeCountGauge.Record(context.Background(), int64(numHealthy))
+	t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
 	if wasHealthy {
 		t.notifyTopologyChange()
 	}

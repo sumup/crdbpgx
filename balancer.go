@@ -19,35 +19,40 @@ const (
 	defaultBalancingTimeout                      = 10 * time.Second
 )
 
+var (
+	newNodeConnectionBalancerMetricsOnce = sync.OnceValue(newNodeConnectionBalancerMetrics)
+)
+
 type balancerMetrics struct {
-	acquireHist metric.Int64Histogram
-	pruneHist   metric.Int64Histogram
+	acquiredConnectionsHistogram metric.Int64Histogram
+	prunedConnectionsHistogram   metric.Int64Histogram
 }
 
-func newBalancerMetrics() (b *balancerMetrics, err error) {
-	b = &balancerMetrics{}
-
-	b.acquireHist, err = meter.Int64Histogram(
+func newNodeConnectionBalancerMetrics() *balancerMetrics {
+	acquireHist, err := meter.Int64Histogram(
 		"crdbpgx.balancer.acquired",
 		metric.WithUnit("{connection}"),
 		metric.WithDescription("connections acquired for pruning"),
 		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer acquire histogram: %w", err)
+		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
 	}
 
-	b.pruneHist, err = meter.Int64Histogram(
+	pruneHist, err := meter.Int64Histogram(
 		"crdbpgx.balancer.pruned",
 		metric.WithUnit("{connection}"),
 		metric.WithDescription("connections pruned per balancing run"),
 		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer prune histogram: %w", err)
+		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
 	}
 
-	return b, nil
+	return &balancerMetrics{
+		acquiredConnectionsHistogram: acquireHist,
+		prunedConnectionsHistogram:   pruneHist,
+	}
 }
 
 // NodeBalancer balances pooled connections across CockroachDB nodes.
@@ -68,8 +73,8 @@ type nodeConnectionBalancer struct {
 	topologyChangeBalanceWindow   time.Duration
 	acceleratedUntil              time.Time
 	balanceTimeout                time.Duration
-	now                           func() time.Time
 	logger                        *slog.Logger
+	metrics                       *balancerMetrics
 	rebalance                     func(context.Context, *Pool)
 }
 
@@ -91,9 +96,9 @@ func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalance
 		balanceTimeout:                defaultBalancingTimeout,
 		logger:                        slog.Default(),
 		balancingInterval:             defaultBalancingInterval,
+		metrics:                       newNodeConnectionBalancerMetricsOnce(),
 		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
 		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
-		now:                           time.Now,
 	}
 	nb.rebalance = nb.rebalancePool
 
@@ -151,7 +156,7 @@ func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 		case <-ctx.Done():
 			return
 		case <-topologyChanges:
-			p.acceleratedUntil = p.now().Add(p.topologyChangeBalanceWindow)
+			p.acceleratedUntil = time.Now().Add(p.topologyChangeBalanceWindow)
 			p.ticker.Reset(p.currentBalancingInterval())
 			p.rebalance(ctx, pool)
 		case <-p.ticker.C:
@@ -180,7 +185,7 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 			c.Release()
 		}
 	}()
-	balancerMeter.acquireHist.Record(ctx, int64(len(conns)),
+	p.metrics.acquiredConnectionsHistogram.Record(ctx, int64(len(conns)),
 		metric.WithAttributes(
 			attribute.String("pool.id", pool.Name()),
 		),
@@ -238,7 +243,7 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 		)
 	}
 
-	balancerMeter.pruneHist.Record(ctx, prunedTotal,
+	p.metrics.prunedConnectionsHistogram.Record(ctx, prunedTotal,
 		metric.WithAttributes(
 			attribute.String("pool.id", pool.Name()),
 		),
@@ -265,7 +270,7 @@ func maxConnsPerNode(maxConns, nodeCount int) int {
 }
 
 func (p *nodeConnectionBalancer) currentBalancingInterval() time.Duration {
-	if p.topologyChangeBalanceWindow > 0 && p.now().Before(p.acceleratedUntil) {
+	if p.topologyChangeBalanceWindow > 0 && time.Now().Before(p.acceleratedUntil) {
 		return p.topologyChangeBalanceInterval
 	}
 	return p.balancingInterval

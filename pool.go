@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -19,12 +18,27 @@ import (
 )
 
 var (
-	metricsMu           sync.Mutex
-	meter               = otel.Meter("github.com/sumup/crdbpgx")
-	resetHistogram      metric.Int64Histogram
-	balancerMeter       *balancerMetrics
-	balancerMetricsOnce = sync.OnceValues(newBalancerMetrics)
+	newPoolMetricsOnce = sync.OnceValue(newPoolMetrics)
 )
+
+type poolMetrics struct {
+	resetHistogram metric.Int64Histogram
+}
+
+func newPoolMetrics() *poolMetrics {
+	resetHistogram, err := meter.Int64Histogram(
+		"crdbpgx.resets",
+		metric.WithDescription("CockroachDB client-side transaction reset distribution"),
+		metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
+	)
+	if err != nil {
+		panic(fmt.Errorf("initialize crdb client resets histogram: %w", err))
+	}
+
+	return &poolMetrics{
+		resetHistogram: resetHistogram,
+	}
+}
 
 // Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with
 // automatic retry logic, node health tracking, and optional connection
@@ -50,6 +64,8 @@ type Pool struct {
 	onShutdown []func()
 	shutdownWG *sync.WaitGroup
 	closeOnce  sync.Once
+
+	metrics *poolMetrics
 }
 
 var (
@@ -84,26 +100,6 @@ func NewPool(
 		return nil, fmt.Errorf("maxRetries must be greater than or equal to 0 (got: %d)", cfg.maxRetries)
 	}
 
-	metricsMu.Lock()
-	if resetHistogram == nil {
-		resetHistogram, err = meter.Int64Histogram(
-			"crdbpgx.resets",
-			metric.WithDescription("CockroachDB client-side transaction reset distribution"),
-			metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
-		)
-		if err != nil {
-			metricsMu.Unlock()
-			return nil, fmt.Errorf("initialize crdb client resets histogram: %w", err)
-		}
-	}
-
-	balancerMeter, err = balancerMetricsOnce()
-	if err != nil {
-		metricsMu.Unlock()
-		return nil, err
-	}
-	metricsMu.Unlock()
-
 	// if no custom health tracker was provided we bootstrap one for this
 	// pool automatically
 	healthTracker := cfg.healthTracker
@@ -116,11 +112,9 @@ func NewPool(
 		}
 
 		healthTrackerCtx, cancel := context.WithCancel(context.Background())
-		shutdownWG.Add(1)
-		go func() {
-			defer shutdownWG.Done()
+		shutdownWG.Go(func() {
 			nodeHealthTracker.Poll(healthTrackerCtx)
-		}()
+		})
 
 		healthTracker = nodeHealthTracker
 		onShutdown = append(onShutdown, cancel)
@@ -136,6 +130,7 @@ func NewPool(
 		logger:         cfg.logger,
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
+		metrics:        newPoolMetricsOnce(),
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
@@ -235,11 +230,9 @@ func NewPool(
 
 	if cfg.balancer != nil {
 		balancerCtx, cancel := context.WithCancel(context.Background())
-		p.shutdownWG.Add(1)
-		go func() {
-			defer p.shutdownWG.Done()
+		p.shutdownWG.Go(func() {
 			cfg.balancer.Run(balancerCtx, p)
-		}()
+		})
 		p.onShutdown = append(p.onShutdown, cancel)
 	}
 
@@ -579,7 +572,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if conn != nil {
 			conn.Release()
 		}
-		resetHistogram.Record(
+		p.metrics.resetHistogram.Record(
 			context.Background(),
 			int64(retries), //nolint:gosec // retries are known to stay within a reasonable range
 			metric.WithAttributes(
