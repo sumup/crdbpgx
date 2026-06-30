@@ -19,10 +19,11 @@ import (
 )
 
 var (
-	metricsMu      sync.Mutex
-	meter          = otel.Meter("github.com/sumup/crdbpgx")
-	resetHistogram metric.Int64Histogram
-	balancerMeter  *balancerMetrics
+	metricsMu           sync.Mutex
+	meter               = otel.Meter("github.com/sumup/crdbpgx")
+	resetHistogram      metric.Int64Histogram
+	balancerMeter       *balancerMetrics
+	balancerMetricsOnce = sync.OnceValues(newBalancerMetrics)
 )
 
 // Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with
@@ -96,12 +97,10 @@ func NewPool(
 		}
 	}
 
-	if balancerMeter == nil {
-		balancerMeter, err = newBalancerMetrics()
-		if err != nil {
-			metricsMu.Unlock()
-			return nil, err
-		}
+	balancerMeter, err = balancerMetricsOnce()
+	if err != nil {
+		metricsMu.Unlock()
+		return nil, err
 	}
 	metricsMu.Unlock()
 

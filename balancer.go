@@ -66,7 +66,9 @@ type nodeConnectionBalancer struct {
 	balancingInterval             time.Duration
 	topologyChangeBalanceInterval time.Duration
 	topologyChangeBalanceWindow   time.Duration
+	acceleratedUntil              time.Time
 	balanceTimeout                time.Duration
+	now                           func() time.Time
 	logger                        *slog.Logger
 	rebalance                     func(context.Context, *Pool)
 }
@@ -91,6 +93,7 @@ func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalance
 		balancingInterval:             defaultBalancingInterval,
 		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
 		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
+		now:                           time.Now,
 	}
 	nb.rebalance = nb.rebalancePool
 
@@ -142,19 +145,18 @@ func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 	defer p.ticker.Stop()
 
 	topologyChanges := topologyChangeEvents(pool.health)
-	var acceleratedUntil time.Time
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-topologyChanges:
-			acceleratedUntil = time.Now().Add(p.topologyChangeBalanceWindow)
-			p.ticker.Reset(p.currentBalancingInterval(time.Now(), acceleratedUntil))
+			p.acceleratedUntil = p.now().Add(p.topologyChangeBalanceWindow)
+			p.ticker.Reset(p.currentBalancingInterval())
 			p.rebalance(ctx, pool)
 		case <-p.ticker.C:
 			p.rebalance(ctx, pool)
-			p.ticker.Reset(p.currentBalancingInterval(time.Now(), acceleratedUntil))
+			p.ticker.Reset(p.currentBalancingInterval())
 		}
 	}
 }
@@ -262,8 +264,8 @@ func maxConnsPerNode(maxConns, nodeCount int) int {
 	return nodeMax
 }
 
-func (p *nodeConnectionBalancer) currentBalancingInterval(now, acceleratedUntil time.Time) time.Duration {
-	if p.topologyChangeBalanceWindow > 0 && now.Before(acceleratedUntil) {
+func (p *nodeConnectionBalancer) currentBalancingInterval() time.Duration {
+	if p.topologyChangeBalanceWindow > 0 && p.now().Before(p.acceleratedUntil) {
 		return p.topologyChangeBalanceInterval
 	}
 	return p.balancingInterval

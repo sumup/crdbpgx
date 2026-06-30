@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNodeConnectionBalancer_AcceleratesAfterNodeLeaves(t *testing.T) {
+func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
 	t.Parallel()
 
 	t.Run("topology changes", func(t *testing.T) {
