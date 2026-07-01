@@ -51,7 +51,8 @@ func TestNodeHealthTracker(t *testing.T) {
 		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
 		require.NoError(t, err)
 
-		topologyChanges := tracker.SubscribeTopologyChanges()
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		defer unsubscribe()
 
 		tracker.SetStatus(1, true)
 		requireNoTopologyChange(t, topologyChanges)
@@ -73,7 +74,8 @@ func TestNodeHealthTracker(t *testing.T) {
 		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
 		require.NoError(t, err)
 
-		topologyChanges := tracker.SubscribeTopologyChanges()
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		defer unsubscribe()
 
 		tracker.SetStatus(1, true)
 		requireNoTopologyChange(t, topologyChanges)
@@ -85,6 +87,22 @@ func TestNodeHealthTracker(t *testing.T) {
 		requireTopologyChange(t, topologyChanges)
 
 		tracker.SetStatus(2, true)
+		requireNoTopologyChange(t, topologyChanges)
+	})
+
+	t.Run("unsubscribes topology changes", func(t *testing.T) {
+		t.Parallel()
+
+		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+		require.NoError(t, err)
+
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		unsubscribe()
+		unsubscribe()
+
+		tracker.SetStatus(1, true)
+		tracker.SetStatus(2, true)
+
 		requireNoTopologyChange(t, topologyChanges)
 	})
 

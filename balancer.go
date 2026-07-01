@@ -153,7 +153,8 @@ func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 	defer p.ticker.Stop()
 
-	topologyChanges := topologyChangeEvents(pool.health)
+	topologyChanges, unsubscribe := topologyChangeEvents(pool.health)
+	defer unsubscribe()
 
 	for {
 		select {
@@ -281,13 +282,13 @@ func (p *nodeConnectionBalancer) currentBalancingInterval() time.Duration {
 }
 
 type topologyChangeSubscriber interface {
-	SubscribeTopologyChanges() <-chan struct{}
+	SubscribeTopologyChanges() (<-chan struct{}, func())
 }
 
-func topologyChangeEvents(health NodeHealthTracker) <-chan struct{} {
+func topologyChangeEvents(health NodeHealthTracker) (<-chan struct{}, func()) {
 	subscriber, ok := health.(topologyChangeSubscriber)
 	if !ok {
-		return nil
+		return nil, func() {}
 	}
 	return subscriber.SubscribeTopologyChanges()
 }

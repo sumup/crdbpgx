@@ -138,7 +138,9 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 //
 // This should be run in a goroutine. It will run until the context is canceled.
 func (t *nodeHealthTracker) Poll(ctx context.Context) {
-	topologyChanges := t.SubscribeTopologyChanges()
+	topologyChanges, unsubscribe := t.SubscribeTopologyChanges()
+	defer unsubscribe()
+
 	jitter := UniformJitter{
 		//nolint:gosec // We use unsecure rand here in an acceptable way.
 		Source: rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -252,14 +254,33 @@ func (t *nodeHealthTracker) NumHealthy() int {
 	return len(t.healthyNodes)
 }
 
-func (t *nodeHealthTracker) SubscribeTopologyChanges() <-chan struct{} {
+func (t *nodeHealthTracker) SubscribeTopologyChanges() (<-chan struct{}, func()) {
 	ch := make(chan struct{}, 1)
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.topologyChangeSubscribers = append(t.topologyChangeSubscribers, ch)
+	t.mu.Unlock()
 
-	return ch
+	var unsubscribeOnce sync.Once
+	unsubscribe := func() {
+		unsubscribeOnce.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+
+			for i, subscriber := range t.topologyChangeSubscribers {
+				if subscriber != ch {
+					continue
+				}
+
+				copy(t.topologyChangeSubscribers[i:], t.topologyChangeSubscribers[i+1:])
+				t.topologyChangeSubscribers[len(t.topologyChangeSubscribers)-1] = nil
+				t.topologyChangeSubscribers = t.topologyChangeSubscribers[:len(t.topologyChangeSubscribers)-1]
+				return
+			}
+		})
+	}
+
+	return ch, unsubscribe
 }
 
 func (t *nodeHealthTracker) notifyTopologyChange() {
