@@ -46,7 +46,7 @@ func newNodeConnectionBalancerMetrics() *balancerMetrics {
 		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
 	)
 	if err != nil {
-		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
+		panic(fmt.Errorf("initialize crdb balancer prune histogram: %w", err))
 	}
 
 	return &balancerMetrics{
@@ -250,7 +250,7 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 	)
 }
 
-// maxConnsPerNode returns the maximum number of connections per pod
+// maxConnsPerNode returns the maximum number of connections per node
 // given the size of the pool and number of nodes.
 //
 // maxConnsPerNode rounds up to ensure we always saturate the pool.
