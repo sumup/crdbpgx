@@ -13,10 +13,20 @@ import (
 )
 
 const (
-	defaultBalancingInterval                     = 30 * time.Second
-	defaultTopologyChangeBalancingInterval       = 5 * time.Second
+	// defaultBalancingInterval is the default interval for how often the balancer prunes excess idle connections.
+	defaultBalancingInterval = 30 * time.Second
+
+	// defaultTopologyChangeBalancingInterval is the default for the balancing interval after a topology
+	// change in the cluster. By default, this interval if faster then when the cluster is stable
+	// to ensure quicker rebalancing of connections.
+	defaultTopologyChangeBalancingInterval = 5 * time.Second
+
+	// defaultTopologyChangeBalancingIntervalWindow is the default for topology change balancing interval window
+	// which controls how long accelerated balancing lasts.
 	defaultTopologyChangeBalancingIntervalWindow = 5 * time.Minute
-	defaultBalancingTimeout                      = 10 * time.Second
+
+	// defaultBalancingTimeout is the default for balancing timeouts which bounds a single balancing operation.
+	defaultBalancingTimeout = 10 * time.Second
 )
 
 var (
@@ -24,8 +34,11 @@ var (
 )
 
 type balancerMetrics struct {
+	// acquiredConnectionsHistogram records idle connections inspected per run.
 	acquiredConnectionsHistogram metric.Int64Histogram
-	prunedConnectionsHistogram   metric.Int64Histogram
+
+	// prunedConnectionsHistogram records connections marked for pruning per run.
+	prunedConnectionsHistogram metric.Int64Histogram
 }
 
 func newNodeConnectionBalancerMetrics() *balancerMetrics {
@@ -66,16 +79,39 @@ type NodeBalancer interface {
 // nodeConnectionBalancer distributes database connections across CockroachDB nodes,
 // rebalancing periodically to maintain even distribution and handle node health changes.
 type nodeConnectionBalancer struct {
-	mu                            *sync.Mutex
-	ticker                        *time.Ticker
-	balancingInterval             time.Duration
+	// mu serializes balancing operations.
+	mu *sync.Mutex
+
+	// ticker schedules periodic balancing runs.
+	ticker *time.Ticker
+
+	// balancingInterval is the regular balancing interval.
+	balancingInterval time.Duration
+
+	// topologyChangeBalanceInterval is the accelerated balancing interval used when
+	// the balancer detects changes in the cluster's topology.
 	topologyChangeBalanceInterval time.Duration
-	topologyChangeBalanceWindow   time.Duration
-	acceleratedUntil              time.Time
-	balanceTimeout                time.Duration
-	logger                        *slog.Logger
-	metrics                       *balancerMetrics
-	rebalance                     func(context.Context, *Pool)
+
+	// topologyChangeBalanceWindow is how long accelerated balancing remains active
+	// after a topology change inside the cluster.
+	topologyChangeBalanceWindow time.Duration
+
+	// acceleratedUntil is the time when accelerated balancing ends.
+	acceleratedUntil time.Time
+
+	// balanceTimeout bounds a single balancing operation.
+	balanceTimeout time.Duration
+
+	// logger emits optional debug logs.
+	logger *slog.Logger
+
+	// metrics contains shared balancer metric instruments.
+	metrics *balancerMetrics
+
+	// rebalance performs the balancing operation.
+	//
+	// IMPORTANT: sole purpose of this field is for testing.
+	rebalance func(context.Context, *Pool)
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that distributes

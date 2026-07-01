@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// exponentialBackoffWithJitter returns a retry backoff function that doubles
+// the delay for each attempt and applies symmetric random jitter.
 func exponentialBackoffWithJitter(scalar time.Duration, jitterFraction float64) func(context.Context, uint) time.Duration {
 	return func(ctx context.Context, attempt uint) time.Duration {
 		// Compute 2^(attempt-1)

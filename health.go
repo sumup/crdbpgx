@@ -14,10 +14,17 @@ import (
 )
 
 const (
-	defaultNodeHealthPollInterval                     = 5 * time.Second
-	defaultTopologyChangeNodeHealthPollInterval       = 5 * time.Second
+	// defaultNodeHealthPollInterval is how often the tracker probes for node health.
+	defaultNodeHealthPollInterval = 5 * time.Second
+
+	// defaultTopologyChangeNodeHealthPollInterval is the faster probe interval used after topology changes.
+	defaultTopologyChangeNodeHealthPollInterval = 5 * time.Second
+
+	// defaultTopologyChangeNodeHealthPollIntervalWindow controls how long accelerated health probing lasts.
 	defaultTopologyChangeNodeHealthPollIntervalWindow = 5 * time.Minute
-	defaultNodeHealthCloseTimeout                     = 5 * time.Second
+
+	// defaultNodeHealthCloseTimeout bounds cleanup of probe connections.
+	defaultNodeHealthCloseTimeout = 5 * time.Second
 )
 
 var (
@@ -25,6 +32,7 @@ var (
 )
 
 type healthTrackerMetrics struct {
+	// healthyNodesGauge records the current healthy node count.
 	healthyNodesGauge metric.Int64Gauge
 }
 
@@ -56,23 +64,44 @@ type NodeHealthTracker interface {
 // and maintains a registry of healthy nodes for use by connection rebalancing
 // and error recovery mechanisms.
 type nodeHealthTracker struct {
-	mu           sync.RWMutex
-	connConfig   *pgx.ConnConfig
-	healthyNodes map[uint32]struct{}
-	nodesSeen    map[uint32]*rate.Limiter
-	newLimiter   func() *rate.Limiter
-	pollInterval time.Duration
-	metrics      *healthTrackerMetrics
+	// mu protects health state and topology subscribers.
+	mu sync.RWMutex
 
+	// connConfig is used when probing CockroachDB nodes.
+	connConfig *pgx.ConnConfig
+
+	// healthyNodes contains node IDs currently considered healthy.
+	healthyNodes map[uint32]struct{}
+
+	// nodesSeen tracks recent failures per known node.
+	nodesSeen map[uint32]*rate.Limiter
+
+	// newLimiter creates failure limiters for node health transitions.
+	newLimiter func() *rate.Limiter
+
+	// pollInterval is the regular health probe interval.
+	pollInterval time.Duration
+
+	// metrics contains shared health tracker metric instruments.
+	metrics *healthTrackerMetrics
+
+	// topologyChangePollInterval is the accelerated probe interval.
 	topologyChangePollInterval time.Duration
-	topologyChangePollWindow   time.Duration
-	topologyChangeSubscribers  []chan struct{}
+
+	// topologyChangePollWindow is how long accelerated probing remains active.
+	topologyChangePollWindow time.Duration
+
+	// topologyChangeSubscribers receive non-blocking topology change signals.
+	topologyChangeSubscribers []chan struct{}
 }
 
 type nodeHealthTrackerConfig struct {
-	pollInterval               time.Duration
+	// pollInterval configures regular health probes.
+	pollInterval time.Duration
+	// topologyChangePollInterval configures accelerated health probes.
 	topologyChangePollInterval time.Duration
-	topologyChangePollWindow   time.Duration
+	// topologyChangePollWindow configures the accelerated probing duration.
+	topologyChangePollWindow time.Duration
 }
 
 // NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].

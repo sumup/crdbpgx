@@ -22,6 +22,7 @@ var (
 )
 
 type poolMetrics struct {
+	// resetHistogram records retry reset counts for completed operations.
 	resetHistogram metric.Int64Histogram
 }
 
@@ -48,23 +49,43 @@ func newPoolMetrics() *poolMetrics {
 // specifically designed for CockroachDB clusters, including automatic handling of
 // retryable and resettable errors, and optional connection management across nodes.
 type Pool struct {
-	pool   *pgxpool.Pool
-	name   string
+	// pool is the wrapped pgx connection pool.
+	pool *pgxpool.Pool
+
+	// name identifies the pool in logs and metrics.
+	name string
+
+	// health tracks CockroachDB node health.
 	health NodeHealthTracker
 
-	mu          sync.RWMutex
-	maxRetries  int
-	nodeForConn map[*pgx.Conn]uint32
-	gc          map[*pgx.Conn]struct{}
+	// mu protects connection tracking and GC state.
+	mu sync.RWMutex
 
+	// maxRetries is the retry limit for database operations.
+	maxRetries int
+
+	// nodeForConn maps live connections to CockroachDB node IDs.
+	nodeForConn map[*pgx.Conn]uint32
+
+	// gc marks connections that should be pruned by pgxpool.
+	gc map[*pgx.Conn]struct{}
+
+	// ctxPropagation controls how caller cancellation reaches database work.
 	ctxPropagation ContextPropagationBehaviour
 
+	// logger emits optional debug logs.
 	logger *slog.Logger
 
+	// onShutdown contains callbacks run during Pool.Close.
 	onShutdown []func()
-	shutdownWG *sync.WaitGroup
-	closeOnce  sync.Once
 
+	// shutdownWG waits for pool-owned background goroutines.
+	shutdownWG *sync.WaitGroup
+
+	// closeOnce makes Pool.Close idempotent.
+	closeOnce sync.Once
+
+	// metrics contains shared pool metric instruments.
 	metrics *poolMetrics
 }
 

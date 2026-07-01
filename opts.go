@@ -11,6 +11,7 @@ const (
 	// https://github.com/cockroachdb/cockroach-go/blob/master/crdb/tx.go#L114
 	DefaultMaxRetries = 50
 
+	// DefaultConnectRate limits how often the pool opens new database connections.
 	DefaultConnectRate = 100 * time.Millisecond
 
 	// DefaultContextPropagationBehaviour is the default behavior for context propagation.
@@ -18,13 +19,26 @@ const (
 )
 
 type poolCfg struct {
-	name           string
-	maxRetries     int
-	connectRate    time.Duration
+	// name identifies the pool in logs and metrics.
+	name string
+
+	// maxRetries is the retry limit for database operations.
+	maxRetries int
+
+	// connectRate limits new connection creation.
+	connectRate time.Duration
+
+	// ctxPropagation controls how caller cancellation reaches database work.
 	ctxPropagation ContextPropagationBehaviour
-	logger         *slog.Logger
-	healthTracker  NodeHealthTracker
-	balancer       NodeBalancer
+
+	// logger emits optional debug logs.
+	logger *slog.Logger
+
+	// healthTracker overrides the default node health tracker.
+	healthTracker NodeHealthTracker
+
+	// balancer overrides the default node connection balancer.
+	balancer NodeBalancer
 }
 
 func defaultPoolCfg() *poolCfg {
