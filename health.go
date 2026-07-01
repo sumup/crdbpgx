@@ -31,7 +31,7 @@ type healthTrackerMetrics struct {
 func newNodeHealthTrackerMetrics() *healthTrackerMetrics {
 	healthyCRDBNodeCountGauge, err := meter.Int64Gauge(
 		"crdb_healthy_nodes",
-		metric.WithDescription("Number of health CRDB nodes detected"),
+		metric.WithDescription("Number of healthy CRDB nodes detected"),
 	)
 	if err != nil {
 		panic(fmt.Errorf("initialize crdb health nodes gauge: %w", err))
@@ -92,8 +92,12 @@ func WithPollInterval(d time.Duration) NodeHealthTrackerOption {
 // The faster interval is active for window. Defaults: 5 seconds for 5 minutes.
 func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTrackerOption {
 	return func(tracker *nodeHealthTrackerConfig) {
-		tracker.topologyChangePollInterval = interval
-		tracker.topologyChangePollWindow = window
+		if interval > 0 {
+			tracker.topologyChangePollInterval = interval
+		}
+		if window > 0 {
+			tracker.topologyChangePollWindow = window
+		}
 	}
 }
 

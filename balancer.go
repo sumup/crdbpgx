@@ -127,8 +127,12 @@ func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOption 
 // The faster interval is active for window. Defaults: 5 seconds for 5 minutes.
 func WithTopologyChangeBalancingInterval(interval, window time.Duration) NodeConnectionBalancerOption {
 	return func(b *nodeConnectionBalancer) {
-		b.topologyChangeBalanceInterval = interval
-		b.topologyChangeBalanceWindow = window
+		if interval > 0 {
+			b.topologyChangeBalanceInterval = interval
+		}
+		if window > 0 {
+			b.topologyChangeBalanceWindow = window
+		}
 	}
 }
 
