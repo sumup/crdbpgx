@@ -1,6 +1,7 @@
 package crdbpgx
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -148,7 +149,7 @@ func NewPool(
 		ctxPropagation: cfg.ctxPropagation,
 		nodeForConn:    make(map[*pgx.Conn]uint32, 0),
 		gc:             make(map[*pgx.Conn]struct{}, 0),
-		logger:         cfg.logger,
+		logger:         cmp.Or(cfg.logger, slog.Default()),
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
 		metrics:        newPoolMetricsOnce(),
@@ -534,8 +535,10 @@ func (p *Pool) connsPerNode() map[uint32]int {
 	return counts
 }
 
+// acquireFromDifferentNode attempts to acquire connections from a different node
+// than currentNodeID.
 func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (*pgxpool.Conn, error) {
-	p.debug(ctx, "crdbpgx: acquiring connection from a different node",
+	p.logger.DebugContext(ctx, "crdbpgx: acquiring connection from a different node",
 		slog.Uint64("current_node_id", uint64(currentNodeID)),
 	)
 
@@ -543,6 +546,9 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 	span.AddEvent("acquiring connection from different node", trace.WithAttributes(
 		attribute.Int64("current_node_id", int64(currentNodeID)),
 	))
+
+	sameNodeAttempts := 0
+	maxSameNodeAttempts := max(p.MaxConns(), 1)
 
 	for {
 		conn, err := p.pool.Acquire(ctx)
@@ -554,7 +560,7 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 		}
 
 		if p.health.NumHealthy() <= 1 {
-			p.debug(ctx, "crdbpgx: only one healthy node available, reuse connection",
+			p.logger.DebugContext(ctx, "crdbpgx: only one healthy node available, reuse connection",
 				slog.Uint64("current_node_id", uint64(currentNodeID)),
 			)
 
@@ -564,13 +570,24 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			return conn, nil
 		}
 
+		if currentNodeID == 0 {
+			p.logger.DebugContext(ctx, "crdbpgx: current node is unknown, reuse acquired connection")
+			span.AddEvent("current node is unknown, reuse acquired connection")
+			return conn, nil
+		}
+
 		id := p.NodeID(conn.Conn())
 		if id == currentNodeID {
+			sameNodeAttempts++
+			p.GCMark(conn.Conn())
 			conn.Release()
+			if sameNodeAttempts >= maxSameNodeAttempts {
+				return nil, fmt.Errorf("acquire connection from different node: acquired %d connection(s) from node %d after reset; no different node available", sameNodeAttempts, currentNodeID)
+			}
 			continue
 		}
 
-		p.debug(ctx, "crdbpgx: acquired connection from different node",
+		p.logger.DebugContext(ctx, "crdbpgx: acquired connection from different node",
 			slog.Uint64("node_id", uint64(id)),
 		)
 
@@ -613,7 +630,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if err == nil {
 			conn.Release()
 			if retries > 0 {
-				p.debug(ctx, "ctdbpgx: successful query after retries",
+				p.logger.DebugContext(ctx, "ctdbpgx: successful query after retries",
 					slog.Uint64("retries", uint64(retries)),
 				)
 			}
@@ -626,7 +643,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			retryableErr  *RetryableError
 		)
 		if errors.As(err, &resettableErr) || conn.Conn().IsClosed() {
-			p.debug(ctx, "crdbpgx: resetting connection", slog.Uint64("retries", uint64(retries)))
+			p.logger.DebugContext(ctx, "crdbpgx: resetting connection", slog.Uint64("retries", uint64(retries)))
 
 			nodeID := p.NodeID(conn.Conn())
 			p.GCMark(conn.Conn())
@@ -645,7 +662,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			}
 			continue
 		} else if errors.As(err, &retryableErr) {
-			p.debug(ctx, "crdbpgx: retryable error",
+			p.logger.DebugContext(ctx, "crdbpgx: retryable error",
 				slog.Uint64("retries", uint64(retries)), slog.Any("error", err),
 			)
 			sleepOnErr(ctx, retries)
@@ -656,7 +673,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		conn.Release()
 
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			p.debug(ctx, "crdbpgx: non-retryable error",
+			p.logger.DebugContext(ctx, "crdbpgx: non-retryable error",
 				slog.Uint64("retries", uint64(retries)),
 				slog.Any("error", err),
 			)
@@ -669,14 +686,6 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		MaxRetries: maxRetries,
 		LastErr:    err,
 	}
-}
-
-func (p *Pool) debug(ctx context.Context, msg string, args ...any) {
-	if p.logger == nil {
-		return
-	}
-
-	p.logger.DebugContext(ctx, msg, args...)
 }
 
 func sleepOnErr(ctx context.Context, retries uint) {
