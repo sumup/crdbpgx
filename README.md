@@ -71,11 +71,15 @@ The database connection pool is a thin wrapper around `pgxpool` adjusted to Cock
 
 Tracks health of nodes in the cluster. This is done in two ways - when executing queries and in a periodical polling loop. In queries, nodes are marked as unhealthy if they fail with a resettable error (i.e. errors that are not a result of a database operation but rather of the underlying connection). The polling mechanism then periodically pings a random node in the cluster and if a node comes back to live or a new node is added their health is tracked as healthy.
 
+After a topology change, the built-in health tracker temporarily uses its topology-change polling interval for 5 minutes. By default this interval is 5 seconds. This helps discover newly added or rejoined nodes faster during rolling upgrades and scale-up events when configured with a lower interval. The accelerated interval and window can be configured with `WithTopologyChangePollInterval`.
+
 The health tracker is owned by the pool as they are coupled closely together but users of this package are free to provide their own implementation of the node health tracker.
 
 ### Node Connection Balancer
 
 Node connection balancer periodically acquires idle connections from the pool and prunes connections that make the distribution across healthy nodes uneven. Configure it with `WithBalancer(crdbpgx.NewNodeConnectionBalancer(...))` when creating a pool. The pool starts the balancer loop with pool-owned lifecycle context and stops it on `Close()`.
+
+When used with the built-in health tracker, the balancer also reacts to topology changes: it rebalances immediately, then temporarily lowers its interval from 30 seconds to 5 seconds for 5 minutes. The accelerated interval and window can be configured with `WithTopologyChangeBalancingInterval`.
 
 If you need manual lifecycle control, create a balancer with `NewNodeConnectionBalancer`, call `Run(ctx, pool)` in your own goroutine for the periodic loop, or call `Rebalance(ctx, pool)` to perform a single balancing operation.
 

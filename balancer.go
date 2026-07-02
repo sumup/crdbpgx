@@ -4,9 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"maps"
-	"math/rand/v2"
-	"slices"
 	"sync"
 	"time"
 
@@ -16,39 +13,59 @@ import (
 )
 
 const (
+	// defaultBalancingInterval is the default interval for how often the balancer prunes excess idle connections.
 	defaultBalancingInterval = 30 * time.Second
-	defaultBalancingTimeout  = 10 * time.Second
+
+	// defaultTopologyChangeBalancingInterval is the default for the balancing interval after a topology
+	// change in the cluster. By default, this interval if faster then when the cluster is stable
+	// to ensure quicker rebalancing of connections.
+	defaultTopologyChangeBalancingInterval = 5 * time.Second
+
+	// defaultTopologyChangeBalancingIntervalWindow is the default for topology change balancing interval window
+	// which controls how long accelerated balancing lasts.
+	defaultTopologyChangeBalancingIntervalWindow = 5 * time.Minute
+
+	// defaultBalancingTimeout is the default for balancing timeouts which bounds a single balancing operation.
+	defaultBalancingTimeout = 10 * time.Second
+)
+
+var (
+	newNodeConnectionBalancerMetricsOnce = sync.OnceValue(newNodeConnectionBalancerMetrics)
 )
 
 type balancerMetrics struct {
-	acquireHist metric.Int64Histogram
-	pruneHist   metric.Int64Histogram
+	// acquiredConnectionsHistogram records idle connections inspected per run.
+	acquiredConnectionsHistogram metric.Int64Histogram
+
+	// prunedConnectionsHistogram records connections marked for pruning per run.
+	prunedConnectionsHistogram metric.Int64Histogram
 }
 
-func newBalancerMetrics() (b *balancerMetrics, err error) {
-	b = &balancerMetrics{}
-
-	b.acquireHist, err = meter.Int64Histogram(
+func newNodeConnectionBalancerMetrics() *balancerMetrics {
+	acquireHist, err := meter.Int64Histogram(
 		"crdbpgx.balancer.acquired",
 		metric.WithUnit("{connection}"),
 		metric.WithDescription("connections acquired for pruning"),
 		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer acquire histogram: %w", err)
+		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
 	}
 
-	b.pruneHist, err = meter.Int64Histogram(
+	pruneHist, err := meter.Int64Histogram(
 		"crdbpgx.balancer.pruned",
 		metric.WithUnit("{connection}"),
 		metric.WithDescription("connections pruned per balancing run"),
 		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("initialize crdb balancer prune histogram: %w", err)
+		panic(fmt.Errorf("initialize crdb balancer prune histogram: %w", err))
 	}
 
-	return b, nil
+	return &balancerMetrics{
+		acquiredConnectionsHistogram: acquireHist,
+		prunedConnectionsHistogram:   pruneHist,
+	}
 }
 
 // NodeBalancer balances pooled connections across CockroachDB nodes.
@@ -62,11 +79,39 @@ type NodeBalancer interface {
 // nodeConnectionBalancer distributes database connections across CockroachDB nodes,
 // rebalancing periodically to maintain even distribution and handle node health changes.
 type nodeConnectionBalancer struct {
-	mu             *sync.Mutex
-	ticker         *time.Ticker
+	// mu serializes balancing operations.
+	mu *sync.Mutex
+
+	// ticker schedules periodic balancing runs.
+	ticker *time.Ticker
+
+	// balancingInterval is the regular balancing interval.
+	balancingInterval time.Duration
+
+	// topologyChangeBalanceInterval is the accelerated balancing interval used when
+	// the balancer detects changes in the cluster's topology.
+	topologyChangeBalanceInterval time.Duration
+
+	// topologyChangeBalanceWindow is how long accelerated balancing remains active
+	// after a topology change inside the cluster.
+	topologyChangeBalanceWindow time.Duration
+
+	// acceleratedUntil is the time when accelerated balancing ends.
+	acceleratedUntil time.Time
+
+	// balanceTimeout bounds a single balancing operation.
 	balanceTimeout time.Duration
-	rnd            *rand.Rand
-	logger         *slog.Logger
+
+	// logger emits optional debug logs.
+	logger *slog.Logger
+
+	// metrics contains shared balancer metric instruments.
+	metrics *balancerMetrics
+
+	// rebalance performs the balancing operation.
+	//
+	// IMPORTANT: sole purpose of this field is for testing.
+	rebalance func(context.Context, *Pool)
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that distributes
@@ -82,13 +127,16 @@ type nodeConnectionBalancer struct {
 // If no interval is specified via [WithBalancingInterval], the default is 30 seconds.
 func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalancer {
 	nb := &nodeConnectionBalancer{
-		mu:             new(sync.Mutex),
-		ticker:         time.NewTicker(defaultBalancingInterval),
-		balanceTimeout: defaultBalancingTimeout,
-		//nolint:gosec // weak random is fine here
-		rnd:    rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
-		logger: slog.Default(),
+		mu:                            new(sync.Mutex),
+		ticker:                        time.NewTicker(defaultBalancingInterval),
+		balanceTimeout:                defaultBalancingTimeout,
+		logger:                        slog.Default(),
+		balancingInterval:             defaultBalancingInterval,
+		metrics:                       newNodeConnectionBalancerMetricsOnce(),
+		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
+		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
 	}
+	nb.rebalance = nb.rebalancePool
 
 	for _, opt := range opts {
 		opt(nb)
@@ -104,7 +152,23 @@ type NodeConnectionBalancerOption func(*nodeConnectionBalancer)
 // Default: 30 seconds.
 func WithBalancingInterval(interval time.Duration) NodeConnectionBalancerOption {
 	return func(b *nodeConnectionBalancer) {
+		b.balancingInterval = interval
 		b.ticker.Reset(interval)
+	}
+}
+
+// WithTopologyChangeBalancingInterval configures a temporary faster balancing
+// interval used after the tracker detects a topology change.
+//
+// The faster interval is active for window. Defaults: 5 seconds for 5 minutes.
+func WithTopologyChangeBalancingInterval(interval, window time.Duration) NodeConnectionBalancerOption {
+	return func(b *nodeConnectionBalancer) {
+		if interval > 0 {
+			b.topologyChangeBalanceInterval = interval
+		}
+		if window > 0 {
+			b.topologyChangeBalanceWindow = window
+		}
 	}
 }
 
@@ -125,18 +189,30 @@ func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 	defer p.ticker.Stop()
 
+	topologyChanges, unsubscribe := topologyChangeEvents(pool.health)
+	defer unsubscribe()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-topologyChanges:
+			p.acceleratedUntil = time.Now().Add(p.topologyChangeBalanceWindow)
+			p.ticker.Reset(p.currentBalancingInterval())
+			p.rebalance(ctx, pool)
 		case <-p.ticker.C:
-			p.Rebalance(ctx, pool)
+			p.rebalance(ctx, pool)
+			p.ticker.Reset(p.currentBalancingInterval())
 		}
 	}
 }
 
 // Rebalance performs one balancing operation.
 func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
+	p.rebalance(ctx, pool)
+}
+
+func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -150,7 +226,7 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 			c.Release()
 		}
 	}()
-	balancerMeter.acquireHist.Record(ctx, int64(len(conns)),
+	p.metrics.acquiredConnectionsHistogram.Record(ctx, int64(len(conns)),
 		metric.WithAttributes(
 			attribute.String("pool.id", pool.Name()),
 		),
@@ -171,26 +247,14 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 		}
 	}
 
-	// Shuffle node pruning order
 	connsPerNode := pool.connsPerNode()
-	nodes := slices.Collect(maps.Keys(connsPerNode))
-	p.rnd.Shuffle(len(nodes), func(i, j int) {
-		nodes[j], nodes[i] = nodes[i], nodes[j]
-	})
 
 	maxConns := pool.MaxConns()
-	perNodeMax := maxConns / nodeCount
+	nodeMax := maxConnsPerNode(maxConns, nodeCount)
 
 	var prunedTotal int64
 
-	for i, nodeID := range nodes {
-		cnt := connsPerNode[nodeID]
-		nodeMax := perNodeMax
-
-		if pool.health.NumHealthy() == 0 || i < maxConns%pool.health.NumHealthy() {
-			perNodeMax++
-		}
-
+	for nodeID, cnt := range connsPerNode {
 		toPrune := cnt - nodeMax
 		if toPrune <= 0 {
 			continue
@@ -220,9 +284,47 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 		)
 	}
 
-	balancerMeter.pruneHist.Record(ctx, prunedTotal,
+	p.metrics.prunedConnectionsHistogram.Record(ctx, prunedTotal,
 		metric.WithAttributes(
 			attribute.String("pool.id", pool.Name()),
 		),
 	)
+}
+
+// maxConnsPerNode returns the maximum number of connections per node
+// given the size of the pool and number of nodes.
+//
+// maxConnsPerNode rounds up to ensure we always saturate the pool.
+// E.g. a pool with size 10 and a cluster with 3 nodes results in
+// the maximum number of connections per node to be 4.
+func maxConnsPerNode(maxConns, nodeCount int) int {
+	if nodeCount <= 0 {
+		return maxConns
+	}
+
+	nodeMax := maxConns / nodeCount
+	if maxConns%nodeCount > 0 {
+		nodeMax++
+	}
+
+	return nodeMax
+}
+
+func (p *nodeConnectionBalancer) currentBalancingInterval() time.Duration {
+	if p.topologyChangeBalanceWindow > 0 && time.Now().Before(p.acceleratedUntil) {
+		return p.topologyChangeBalanceInterval
+	}
+	return p.balancingInterval
+}
+
+type topologyChangeSubscriber interface {
+	SubscribeTopologyChanges() (<-chan struct{}, func())
+}
+
+func topologyChangeEvents(health NodeHealthTracker) (<-chan struct{}, func()) {
+	subscriber, ok := health.(topologyChangeSubscriber)
+	if !ok {
+		return nil, func() {}
+	}
+	return subscriber.SubscribeTopologyChanges()
 }

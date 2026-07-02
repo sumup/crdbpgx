@@ -72,3 +72,9 @@
 //		return fmt.Errorf("transfer funds: %w", err)
 //	}
 package crdbpgx
+
+import "go.opentelemetry.io/otel"
+
+var (
+	meter = otel.Meter("github.com/sumup/crdbpgx")
+)

@@ -45,6 +45,67 @@ func TestNodeHealthTracker(t *testing.T) {
 		require.Equal(1, tracker.NumHealthy())
 	})
 
+	t.Run("notifies topology changes when healthy node becomes unhealthy", func(t *testing.T) {
+		t.Parallel()
+
+		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+		require.NoError(t, err)
+
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		defer unsubscribe()
+
+		tracker.SetStatus(1, true)
+		requireNoTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(1, false)
+		tracker.SetStatus(1, false)
+		requireNoTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(1, false)
+		requireTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(1, false)
+		requireNoTopologyChange(t, topologyChanges)
+	})
+
+	t.Run("notifies topology changes when a new node becomes healthy", func(t *testing.T) {
+		t.Parallel()
+
+		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+		require.NoError(t, err)
+
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		defer unsubscribe()
+
+		tracker.SetStatus(1, true)
+		requireNoTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(1, true)
+		requireNoTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(2, true)
+		requireTopologyChange(t, topologyChanges)
+
+		tracker.SetStatus(2, true)
+		requireNoTopologyChange(t, topologyChanges)
+	})
+
+	t.Run("unsubscribes topology changes", func(t *testing.T) {
+		t.Parallel()
+
+		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+		require.NoError(t, err)
+
+		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
+		unsubscribe()
+		unsubscribe()
+
+		tracker.SetStatus(1, true)
+		tracker.SetStatus(2, true)
+
+		requireNoTopologyChange(t, topologyChanges)
+	})
+
 	t.Run("poll context cancelation", func(t *testing.T) {
 		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{}, crdbpgx.WithPollInterval(time.Hour))
 		require.NoError(t, err)
@@ -67,4 +128,24 @@ func TestNodeHealthTracker(t *testing.T) {
 			}
 		}, time.Second, 10*time.Millisecond)
 	})
+}
+
+func requireTopologyChange(t *testing.T, topologyChanges <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-topologyChanges:
+	case <-time.After(time.Second):
+		t.Fatal("expected topology change")
+	}
+}
+
+func requireNoTopologyChange(t *testing.T, topologyChanges <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-topologyChanges:
+		t.Fatal("unexpected topology change")
+	case <-time.After(25 * time.Millisecond):
+	}
 }
