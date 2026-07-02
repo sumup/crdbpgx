@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestMaxConnsPerNode(t *testing.T) {
+func Test_maxConnsPerNode(t *testing.T) {
 	t.Parallel()
 
 	t.Run("allows any node to hold the remainder connection", func(t *testing.T) {

@@ -255,13 +255,17 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 	var prunedTotal int64
 
 	for nodeID, cnt := range connsPerNode {
+		// Prune only connections above the per-node maximum. When there is
+		// more than one excess connection, prune half of the excess so the
+		// balancer converges gradually instead of tearing down too much at once.
 		toPrune := cnt - nodeMax
 		if toPrune <= 0 {
 			continue
 		}
-
-		// Only prune half of the connections to avoid excessive connection teardown
-		toPrune = min(toPrune>>1, len(healthyConns[nodeID]))
+		if toPrune > 1 {
+			toPrune >>= 1
+		}
+		toPrune = min(toPrune, len(healthyConns[nodeID]))
 		if toPrune == 0 {
 			continue
 		}
