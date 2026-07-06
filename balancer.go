@@ -263,7 +263,7 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 			continue
 		}
 		if toPrune > 1 {
-			toPrune >>= 1
+			toPrune /= 2
 		}
 		toPrune = min(toPrune, len(healthyConns[nodeID]))
 		if toPrune == 0 {
