@@ -156,6 +156,15 @@ func NewPool(
 	}
 
 	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
+	beforeConnect := pgxConfig.BeforeConnect
+	pgxConfig.BeforeConnect = func(ctx context.Context, connConfig *pgx.ConnConfig) error {
+		if beforeConnect != nil {
+			if err := beforeConnect(ctx, connConfig); err != nil {
+				return err
+			}
+		}
+		return limiter.Wait(ctx)
+	}
 
 	afterConnect := pgxConfig.AfterConnect
 	pgxConfig.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
@@ -166,17 +175,14 @@ func NewPool(
 			}
 		}
 
+		id := nodeID(c)
 		p.mu.Lock()
-		defer p.mu.Unlock()
-
 		delete(p.nodeForConn, c)
 		delete(p.gc, c)
-		healthTracker.SetStatus(nodeID(c), true)
+		p.nodeForConn[c] = id
+		p.mu.Unlock()
 
-		if err := limiter.Wait(ctx); err != nil {
-			return err
-		}
-		p.nodeForConn[c] = nodeID(c)
+		healthTracker.SetStatus(id, true)
 		return nil
 	}
 

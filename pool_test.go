@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -102,4 +103,35 @@ func TestPool_Close(t *testing.T) {
 		pool.Close()
 		pool.Close()
 	})
+}
+
+func TestPool_RateLimitsBeforeConnect(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := pgxpool.ParseConfig("postgres://user:password@127.0.0.1:1/db?pool_min_conns=0&pool_min_idle_conns=0")
+	require.NoError(t, err)
+
+	var beforeConnectCalls int
+	cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error {
+		beforeConnectCalls++
+		return nil
+	}
+
+	pool, err := crdbpgx.NewPool(
+		t.Context(),
+		cfg,
+		crdbpgx.WithHealthTracker(fakeHealthTracker{}),
+		crdbpgx.WithConnectRate(time.Hour),
+	)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	beforeConnect := pool.Config().BeforeConnect
+	require.NotNil(t, beforeConnect)
+	require.NoError(t, beforeConnect(t.Context(), cfg.ConnConfig))
+
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, beforeConnect(canceledCtx, cfg.ConnConfig), context.Canceled)
+	require.Equal(t, 2, beforeConnectCalls)
 }
