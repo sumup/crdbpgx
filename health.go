@@ -25,6 +25,10 @@ const (
 
 	// defaultNodeHealthCloseTimeout bounds cleanup of probe connections.
 	defaultNodeHealthCloseTimeout = 5 * time.Second
+
+	// defaultNodeStaleTimeout is how long an observed node without live pooled
+	// connections remains part of the healthy topology.
+	defaultNodeStaleTimeout = 10 * time.Minute
 )
 
 var (
@@ -76,6 +80,13 @@ type nodeHealthTracker struct {
 	// nodesSeen tracks recent failures per known node.
 	nodesSeen map[uint32]*rate.Limiter
 
+	// lastSeen tracks the last successful connection or health probe per node.
+	lastSeen map[uint32]time.Time
+
+	// liveConnections tracks pooled connections per node across pools sharing
+	// this health tracker.
+	liveConnections map[uint32]int
+
 	// newLimiter creates failure limiters for node health transitions.
 	newLimiter func() *rate.Limiter
 
@@ -91,6 +102,10 @@ type nodeHealthTracker struct {
 	// topologyChangePollWindow is how long accelerated probing remains active.
 	topologyChangePollWindow time.Duration
 
+	// nodeStaleTimeout bounds how long nodes without live pooled connections
+	// remain healthy without another successful observation.
+	nodeStaleTimeout time.Duration
+
 	// topologyChangeSubscribers receive non-blocking topology change signals.
 	topologyChangeSubscribers []chan struct{}
 }
@@ -102,6 +117,8 @@ type nodeHealthTrackerConfig struct {
 	topologyChangePollInterval time.Duration
 	// topologyChangePollWindow configures the accelerated probing duration.
 	topologyChangePollWindow time.Duration
+	// nodeStaleTimeout configures expiry of unobserved nodes without live connections.
+	nodeStaleTimeout time.Duration
 }
 
 // NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
@@ -130,6 +147,17 @@ func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTr
 	}
 }
 
+// WithNodeStaleTimeout configures how long an observed node without live pooled
+// connections remains healthy without another successful health probe.
+// A zero timeout disables stale-node expiry. The default is 10 minutes.
+func WithNodeStaleTimeout(timeout time.Duration) NodeHealthTrackerOption {
+	return func(tracker *nodeHealthTrackerConfig) {
+		if timeout >= 0 {
+			tracker.nodeStaleTimeout = timeout
+		}
+	}
+}
+
 // NewNodeHealthTracker creates a new [nodeHealthTracker].
 //
 // The tracker periodically probes for healthy nodes in the CockroachDB cluster
@@ -139,6 +167,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		pollInterval:               defaultNodeHealthPollInterval,
 		topologyChangePollInterval: defaultTopologyChangeNodeHealthPollInterval,
 		topologyChangePollWindow:   defaultTopologyChangeNodeHealthPollIntervalWindow,
+		nodeStaleTimeout:           defaultNodeStaleTimeout,
 	}
 	for _, o := range opts {
 		o(tCfg)
@@ -149,8 +178,11 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		pollInterval:               tCfg.pollInterval,
 		topologyChangePollInterval: tCfg.topologyChangePollInterval,
 		topologyChangePollWindow:   tCfg.topologyChangePollWindow,
+		nodeStaleTimeout:           tCfg.nodeStaleTimeout,
 		healthyNodes:               make(map[uint32]struct{}),
 		nodesSeen:                  make(map[uint32]*rate.Limiter),
+		lastSeen:                   make(map[uint32]time.Time),
+		liveConnections:            make(map[uint32]int),
 		metrics:                    newNodeHealthTrackerMetricsOnce(),
 		topologyChangeSubscribers:  make([]chan struct{}, 0),
 		newLimiter: func() *rate.Limiter {
@@ -189,6 +221,7 @@ func (t *nodeHealthTracker) Poll(ctx context.Context) {
 			acceleratedUntil = time.Now().Add(t.topologyChangePollWindow)
 		case <-timer.C:
 			t.tryConnection(ctx, interval)
+			t.expireStaleNodes(time.Now())
 		}
 	}
 }
@@ -226,26 +259,21 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 // as unhealthy only if it has failed more than twice in the last minute (rate limited
 // to prevent marking nodes as unhealthy due to transient errors).
 func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
-	t.mu.Lock()
-
-	nodeLimiter, nodeHasBeenSeen := t.nodesSeen[nodeID]
-	if !nodeHasBeenSeen {
-		nodeLimiter = t.newLimiter()
-		t.nodesSeen[nodeID] = nodeLimiter
+	if healthy {
+		t.setHealthy(nodeID, false)
+		return
 	}
 
-	if healthy {
-		_, wasHealthy := t.healthyNodes[nodeID]
-		hadHealthyNodes := len(t.healthyNodes) > 0
-		t.healthyNodes[nodeID] = struct{}{}
-		t.nodesSeen[nodeID] = t.newLimiter()
-		numHealthy := len(t.healthyNodes)
+	t.mu.Lock()
+	if _, isHealthy := t.healthyNodes[nodeID]; !isHealthy {
 		t.mu.Unlock()
-		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
-		if !wasHealthy && hadHealthyNodes {
-			t.notifyTopologyChange()
-		}
 		return
+	}
+
+	nodeLimiter := t.nodesSeen[nodeID]
+	if nodeLimiter == nil {
+		nodeLimiter = t.newLimiter()
+		t.nodesSeen[nodeID] = nodeLimiter
 	}
 
 	// If the limiter allows the request, we haven't seen more than 2 failures in the past minute.
@@ -259,6 +287,8 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 
 	_, wasHealthy := t.healthyNodes[nodeID]
 	delete(t.healthyNodes, nodeID)
+	delete(t.nodesSeen, nodeID)
+	delete(t.lastSeen, nodeID)
 	numHealthy := len(t.healthyNodes)
 	t.mu.Unlock()
 
@@ -266,6 +296,73 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	if wasHealthy {
 		t.notifyTopologyChange()
 	}
+}
+
+func (t *nodeHealthTracker) connectionOpened(nodeID uint32) {
+	t.setHealthy(nodeID, true)
+}
+
+func (t *nodeHealthTracker) setHealthy(nodeID uint32, connectionOpened bool) {
+	t.mu.Lock()
+	_, wasHealthy := t.healthyNodes[nodeID]
+	hadHealthyNodes := len(t.healthyNodes) > 0
+	t.healthyNodes[nodeID] = struct{}{}
+	t.nodesSeen[nodeID] = t.newLimiter()
+	t.lastSeen[nodeID] = time.Now()
+	if connectionOpened {
+		t.liveConnections[nodeID]++
+	}
+	numHealthy := len(t.healthyNodes)
+	t.mu.Unlock()
+
+	t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+	if !wasHealthy && hadHealthyNodes {
+		t.notifyTopologyChange()
+	}
+}
+
+func (t *nodeHealthTracker) connectionClosed(nodeID uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.liveConnections[nodeID] <= 1 {
+		delete(t.liveConnections, nodeID)
+		return
+	}
+	t.liveConnections[nodeID]--
+}
+
+func (t *nodeHealthTracker) expireStaleNodes(now time.Time) {
+	if t.nodeStaleTimeout <= 0 {
+		return
+	}
+
+	t.mu.Lock()
+	topologyChanged := false
+	for nodeID := range t.healthyNodes {
+		if t.liveConnections[nodeID] > 0 {
+			continue
+		}
+
+		lastSeen, ok := t.lastSeen[nodeID]
+		if ok && now.Sub(lastSeen) < t.nodeStaleTimeout {
+			continue
+		}
+
+		delete(t.healthyNodes, nodeID)
+		delete(t.nodesSeen, nodeID)
+		delete(t.lastSeen, nodeID)
+		topologyChanged = true
+	}
+	numHealthy := len(t.healthyNodes)
+	t.mu.Unlock()
+
+	if !topologyChanged {
+		return
+	}
+
+	t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+	t.notifyTopologyChange()
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.

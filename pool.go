@@ -166,17 +166,18 @@ func NewPool(
 			}
 		}
 
+		id := nodeID(c)
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
 		delete(p.nodeForConn, c)
 		delete(p.gc, c)
-		healthTracker.SetStatus(nodeID(c), true)
 
 		if err := limiter.Wait(ctx); err != nil {
 			return err
 		}
-		p.nodeForConn[c] = nodeID(c)
+		p.nodeForConn[c] = id
+		trackConnectionOpened(healthTracker, id)
 		return nil
 	}
 
@@ -234,10 +235,16 @@ func NewPool(
 		if beforeClose != nil {
 			beforeClose(c)
 		}
+
 		p.mu.Lock()
-		defer p.mu.Unlock()
+		id, tracked := p.nodeForConn[c]
 		delete(p.nodeForConn, c)
 		delete(p.gc, c)
+		p.mu.Unlock()
+
+		if tracked {
+			trackConnectionClosed(healthTracker, id)
+		}
 	}
 
 	// Finally, we create the actual connection pool
@@ -517,9 +524,33 @@ func (p *Pool) NodeID(conn *pgx.Conn) uint32 {
 // This is used internally for connection rebalancing and when recovering from node failures.
 func (p *Pool) GCMark(conn *pgx.Conn) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.gc[conn] = struct{}{}
+	id, tracked := p.nodeForConn[conn]
 	delete(p.nodeForConn, conn)
+	p.mu.Unlock()
+
+	if tracked {
+		trackConnectionClosed(p.health, id)
+	}
+}
+
+type connectionLifecycleTracker interface {
+	connectionOpened(nodeID uint32)
+	connectionClosed(nodeID uint32)
+}
+
+func trackConnectionOpened(tracker NodeHealthTracker, nodeID uint32) {
+	if tracker, ok := tracker.(connectionLifecycleTracker); ok {
+		tracker.connectionOpened(nodeID)
+		return
+	}
+	tracker.SetStatus(nodeID, true)
+}
+
+func trackConnectionClosed(tracker NodeHealthTracker, nodeID uint32) {
+	if tracker, ok := tracker.(connectionLifecycleTracker); ok {
+		tracker.connectionClosed(nodeID)
+	}
 }
 
 // connsPerNode count the active connection per nodeID.
