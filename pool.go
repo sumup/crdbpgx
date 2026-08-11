@@ -342,13 +342,15 @@ type Runner interface {
 	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
 	QueryFunc(ctx context.Context, rowsFunc func(context.Context, pgx.Rows) error, sql string, optionsAndArgs ...any) error
 	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
+	// InTxFunc ignores [pgx.TxOptions] when invoked as a nested (pseudo) transaction.
+	InTxFunc(context.Context, pgx.TxOptions, func(Tx) error) error
 }
 
 // Tx represents a CockroachDB database transaction.
 //
 // Tx can be used in place of [pgx.Tx] and provides additional methods that are also defined
 // on [Pool] such that users can use the same set of functions both outside and inside
-// a transaction (ExecFunc, QueryFunc, QueryRowFunc).
+// a transaction (ExecFunc, QueryFunc, QueryRowFunc, InTxFunc).
 type Tx interface {
 	pgx.Tx
 	Runner
@@ -393,6 +395,18 @@ func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc fun
 		}
 		return txFunc(tx)
 	})
+}
+
+func (t crdbTx) InTxFunc(
+	ctx context.Context,
+	_ pgx.TxOptions,
+	fn func(Tx) error,
+) error {
+	nested, err := t.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin savepoint: %w", err)
+	}
+	return beginFuncExec(ctx, crdbTx{nested}, fn)
 }
 
 type crdbTx struct{ pgx.Tx }
