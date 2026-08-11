@@ -88,6 +88,9 @@ type Pool struct {
 
 	// metrics contains shared pool metric instruments.
 	metrics *poolMetrics
+
+	// connectLimiter applies a rate limit for connection attempts
+	connectLimiter *rate.Limiter
 }
 
 var (
@@ -153,31 +156,12 @@ func NewPool(
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
 		metrics:        newPoolMetricsOnce(),
+		connectLimiter: rate.NewLimiter(rate.Every(cfg.connectRate), 1),
 	}
-
-	limiter := rate.NewLimiter(rate.Every(cfg.connectRate), 1)
 
 	afterConnect := pgxConfig.AfterConnect
 	pgxConfig.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
-		// Execute afterConnect hook if passed before
-		if afterConnect != nil {
-			if err := afterConnect(ctx, c); err != nil {
-				return err
-			}
-		}
-
-		p.mu.Lock()
-		defer p.mu.Unlock()
-
-		delete(p.nodeForConn, c)
-		delete(p.gc, c)
-		healthTracker.SetStatus(nodeID(c), true)
-
-		if err := limiter.Wait(ctx); err != nil {
-			return err
-		}
-		p.nodeForConn[c] = nodeID(c)
-		return nil
+		return p.afterConnect(ctx, c, afterConnect)
 	}
 
 	// if we attempt to acquire or release a connection that has been marked for
@@ -533,6 +517,31 @@ func (p *Pool) connsPerNode() map[uint32]int {
 	}
 
 	return counts
+}
+
+type afterConnectFunc func(context.Context, *pgx.Conn) error
+
+func (p *Pool) afterConnect(ctx context.Context, conn *pgx.Conn, wrapped afterConnectFunc) error {
+	if wrapped != nil {
+		if err := wrapped(ctx, conn); err != nil {
+			return err
+		}
+	}
+
+	if err := p.connectLimiter.Wait(ctx); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.nodeForConn, conn)
+	delete(p.gc, conn)
+
+	p.health.SetStatus(nodeID(conn), true)
+	p.nodeForConn[conn] = nodeID(conn)
+
+	return nil
 }
 
 func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (*pgxpool.Conn, error) {
