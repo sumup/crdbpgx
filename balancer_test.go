@@ -27,11 +27,12 @@ func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
 			).(*nodeConnectionBalancer)
 
 			rebalanced := make(chan struct{}, 10)
-			balancer.rebalance = func(context.Context, *Pool) {
+			balancer.rebalance = func(context.Context, *Pool) balanceResult {
 				select {
 				case rebalanced <- struct{}{}:
 				default:
 				}
+				return balanceResult{}
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -40,7 +41,7 @@ func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				balancer.Run(ctx, &Pool{health: tracker})
+				balancer.Run(ctx, &Pool{health: tracker, stats: new(poolStats)})
 			}()
 
 			select {
@@ -81,11 +82,12 @@ func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
 			).(*nodeConnectionBalancer)
 
 			rebalanced := make(chan struct{}, 10)
-			balancer.rebalance = func(context.Context, *Pool) {
+			balancer.rebalance = func(context.Context, *Pool) balanceResult {
 				select {
 				case rebalanced <- struct{}{}:
 				default:
 				}
+				return balanceResult{}
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -94,7 +96,7 @@ func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				balancer.Run(ctx, &Pool{health: tracker})
+				balancer.Run(ctx, &Pool{health: tracker, stats: new(poolStats)})
 			}()
 
 			tracker.SetStatus(1, true)

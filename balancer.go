@@ -2,14 +2,11 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -28,45 +25,6 @@ const (
 	// defaultBalancingTimeout is the default for balancing timeouts which bounds a single balancing operation.
 	defaultBalancingTimeout = 10 * time.Second
 )
-
-var (
-	newNodeConnectionBalancerMetricsOnce = sync.OnceValue(newNodeConnectionBalancerMetrics)
-)
-
-type balancerMetrics struct {
-	// acquiredConnectionsHistogram records idle connections inspected per run.
-	acquiredConnectionsHistogram metric.Int64Histogram
-
-	// prunedConnectionsHistogram records connections marked for pruning per run.
-	prunedConnectionsHistogram metric.Int64Histogram
-}
-
-func newNodeConnectionBalancerMetrics() *balancerMetrics {
-	acquireHist, err := meter.Int64Histogram(
-		"crdbpgx.balancer.acquired",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections acquired for pruning"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
-	}
-
-	pruneHist, err := meter.Int64Histogram(
-		"crdbpgx.balancer.pruned",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections pruned per balancing run"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb balancer prune histogram: %w", err))
-	}
-
-	return &balancerMetrics{
-		acquiredConnectionsHistogram: acquireHist,
-		prunedConnectionsHistogram:   pruneHist,
-	}
-}
 
 // NodeBalancer balances pooled connections across CockroachDB nodes.
 type NodeBalancer interface {
@@ -105,13 +63,19 @@ type nodeConnectionBalancer struct {
 	// logger emits optional debug logs.
 	logger *slog.Logger
 
-	// metrics contains shared balancer metric instruments.
-	metrics *balancerMetrics
+	// tracer observes connection balancing runs.
+	tracer Tracer
 
 	// rebalance performs the balancing operation.
 	//
 	// IMPORTANT: sole purpose of this field is for testing.
-	rebalance func(context.Context, *Pool)
+	rebalance func(context.Context, *Pool) balanceResult
+}
+
+type balanceResult struct {
+	healthyNodes        int
+	acquiredConnections int
+	prunedConnections   int
 }
 
 // NewNodeConnectionBalancer creates a connection balancer that distributes
@@ -132,7 +96,7 @@ func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalance
 		balanceTimeout:                defaultBalancingTimeout,
 		logger:                        slog.Default(),
 		balancingInterval:             defaultBalancingInterval,
-		metrics:                       newNodeConnectionBalancerMetricsOnce(),
+		tracer:                        NopTracer{},
 		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
 		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
 	}
@@ -180,6 +144,17 @@ func WithBalancingTimeout(timeout time.Duration) NodeConnectionBalancerOption {
 	}
 }
 
+// WithBalancerTracer configures a tracer for connection balancing runs.
+// A Pool configured with [WithTracer] injects its tracer into the built-in
+// balancer automatically.
+func WithBalancerTracer(tracer Tracer) NodeConnectionBalancerOption {
+	return func(b *nodeConnectionBalancer) {
+		if tracer != nil {
+			b.tracer = tracer
+		}
+	}
+}
+
 // Run continuously rebalances connections at the configured interval.
 //
 // This should be run in a goroutine. It will run until the context is canceled.
@@ -199,9 +174,9 @@ func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 		case <-topologyChanges:
 			p.acceleratedUntil = time.Now().Add(p.topologyChangeBalanceWindow)
 			p.ticker.Reset(p.currentBalancingInterval())
-			p.rebalance(ctx, pool)
+			p.traceRebalance(ctx, pool)
 		case <-p.ticker.C:
-			p.rebalance(ctx, pool)
+			p.traceRebalance(ctx, pool)
 			p.ticker.Reset(p.currentBalancingInterval())
 		}
 	}
@@ -209,10 +184,26 @@ func (p *nodeConnectionBalancer) Run(ctx context.Context, pool *Pool) {
 
 // Rebalance performs one balancing operation.
 func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
-	p.rebalance(ctx, pool)
+	p.traceRebalance(ctx, pool)
 }
 
-func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) {
+func (p *nodeConnectionBalancer) traceRebalance(ctx context.Context, pool *Pool) {
+	tracer := p.lifecycleTracer()
+	result := p.rebalance(ctx, pool)
+
+	pool.stats.balancerRuns.Add(1)
+	pool.stats.balancerAcquiredConnections.Add(uint64(result.acquiredConnections))
+	pool.stats.balancerPrunedConnections.Add(uint64(result.prunedConnections))
+
+	tracer.TraceBalancer(ctx, TraceBalancerData{
+		PoolName:            pool.Name(),
+		HealthyNodes:        result.healthyNodes,
+		AcquiredConnections: result.acquiredConnections,
+		PrunedConnections:   result.prunedConnections,
+	})
+}
+
+func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) balanceResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -226,12 +217,6 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 			c.Release()
 		}
 	}()
-	p.metrics.acquiredConnectionsHistogram.Record(ctx, int64(len(conns)),
-		metric.WithAttributes(
-			attribute.String("pool.id", pool.Name()),
-		),
-	)
-
 	nodeCount := max(pool.health.NumHealthy(), 1)
 
 	healthyConns := make(map[uint32][]*pgxpool.Conn, nodeCount)
@@ -288,11 +273,28 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 		)
 	}
 
-	p.metrics.prunedConnectionsHistogram.Record(ctx, prunedTotal,
-		metric.WithAttributes(
-			attribute.String("pool.id", pool.Name()),
-		),
-	)
+	return balanceResult{
+		healthyNodes:        pool.health.NumHealthy(),
+		acquiredConnections: len(conns),
+		prunedConnections:   int(prunedTotal),
+	}
+}
+
+func (p *nodeConnectionBalancer) setTracer(tracer Tracer) {
+	if tracer != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.tracer = tracer
+	}
+}
+
+func (p *nodeConnectionBalancer) lifecycleTracer() Tracer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tracer == nil {
+		return NopTracer{}
+	}
+	return p.tracer
 }
 
 // maxConnsPerNode returns the maximum number of connections per node

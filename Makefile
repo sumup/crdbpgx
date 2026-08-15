@@ -6,32 +6,34 @@ help: ## Show help
 
 .PHONY: fmt
 fmt: ## Format go files
-	golangci-lint fmt --verbose
+	golangci-lint fmt --verbose ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: lint
 lint: ## Lint go files
-	golangci-lint run --verbose
+	golangci-lint run --verbose ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: lint-fix
 lint-fix: ## Lint go files and apply auto-fixes
-	golangci-lint run --verbose --fix
+	golangci-lint run --verbose --fix ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: test
 test: ## Run tests
-	go test -v -failfast -race -timeout 10m ./...
+	go test -v -failfast -race -timeout 10m ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: download
 download:
 	@echo Download go.mod dependencies
 	@go mod download
+	@go -C crdbotel mod download
+	@go -C crdbprom mod download
 
 .PHONY: vulncheck
 vulncheck: ## Check for Vulnerabilities (make sure you have the tools install: `make install-tools`)
-	govulncheck ./...
+	govulncheck ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: vulncheck-sarif
 vulncheck-sarif: ## Check for Vulnerabilities
-	govulncheck -format=sarif ./... > govulncheck.sarif
+	govulncheck -format=sarif ./... ./crdbotel/... ./crdbprom/... > govulncheck.sarif
 
 .PHONY: generate
 generate: # Generate latest SDK

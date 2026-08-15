@@ -39,6 +39,9 @@ type poolCfg struct {
 
 	// balancer overrides the default node connection balancer.
 	balancer NodeBalancer
+
+	// tracer observes CockroachDB-specific lifecycle events.
+	tracer Tracer
 }
 
 func defaultPoolCfg() *poolCfg {
@@ -47,6 +50,7 @@ func defaultPoolCfg() *poolCfg {
 		maxRetries:     DefaultMaxRetries,
 		connectRate:    DefaultConnectRate,
 		ctxPropagation: DefaultContextPropagationBehaviour,
+		tracer:         NopTracer{},
 	}
 }
 
@@ -115,5 +119,18 @@ func WithHealthTracker(h NodeHealthTracker) Option {
 func WithBalancer(b NodeBalancer) Option {
 	return func(pc *poolCfg) {
 		pc.balancer = b
+	}
+}
+
+// WithTracer configures a tracer for CockroachDB-specific pool, health tracker,
+// and connection balancer lifecycle events.
+//
+// If tracer also implements pgx.QueryTracer and the pgx configuration does not
+// already have a tracer, NewPool installs it for query-level tracing as well.
+func WithTracer(tracer Tracer) Option {
+	return func(pc *poolCfg) {
+		if tracer != nil {
+			pc.tracer = tracer
+		}
 	}
 }

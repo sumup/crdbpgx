@@ -12,35 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 )
-
-var (
-	newPoolMetricsOnce = sync.OnceValue(newPoolMetrics)
-)
-
-type poolMetrics struct {
-	// resetHistogram records retry reset counts for completed operations.
-	resetHistogram metric.Int64Histogram
-}
-
-func newPoolMetrics() *poolMetrics {
-	resetHistogram, err := meter.Int64Histogram(
-		"crdbpgx.resets",
-		metric.WithDescription("CockroachDB client-side transaction reset distribution"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb client resets histogram: %w", err))
-	}
-
-	return &poolMetrics{
-		resetHistogram: resetHistogram,
-	}
-}
 
 // Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with
 // automatic retry logic, node health tracking, and optional connection
@@ -86,8 +59,11 @@ type Pool struct {
 	// closeOnce makes Pool.Close idempotent.
 	closeOnce sync.Once
 
-	// metrics contains shared pool metric instruments.
-	metrics *poolMetrics
+	// stats contains cumulative CockroachDB-specific pool statistics.
+	stats *poolStats
+
+	// tracer observes CockroachDB-specific lifecycle events.
+	tracer Tracer
 
 	// connectLimiter applies a rate limit for connection attempts
 	connectLimiter *rate.Limiter
@@ -124,6 +100,11 @@ func NewPool(
 	if cfg.maxRetries < 0 {
 		return nil, fmt.Errorf("maxRetries must be greater than or equal to 0 (got: %d)", cfg.maxRetries)
 	}
+	if pgxConfig.ConnConfig.Tracer == nil {
+		if queryTracer, ok := cfg.tracer.(pgx.QueryTracer); ok {
+			pgxConfig.ConnConfig.Tracer = queryTracer
+		}
+	}
 
 	// if no custom health tracker was provided we bootstrap one for this
 	// pool automatically
@@ -131,7 +112,10 @@ func NewPool(
 	var onShutdown []func()
 	shutdownWG := new(sync.WaitGroup)
 	if healthTracker == nil {
-		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig)
+		nodeHealthTracker, err := NewNodeHealthTracker(
+			pgxConfig.ConnConfig,
+			WithNodeHealthTracer(cfg.tracer),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("new node health tracker: %w", err)
 		}
@@ -143,6 +127,8 @@ func NewPool(
 
 		healthTracker = nodeHealthTracker
 		onShutdown = append(onShutdown, cancel)
+	} else if setter, ok := healthTracker.(interface{ setTracer(Tracer) }); ok {
+		setter.setTracer(cfg.tracer)
 	}
 
 	p := &Pool{
@@ -155,7 +141,8 @@ func NewPool(
 		logger:         cmp.Or(cfg.logger, slog.Default()),
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
-		metrics:        newPoolMetricsOnce(),
+		stats:          new(poolStats),
+		tracer:         cfg.tracer,
 		connectLimiter: rate.NewLimiter(rate.Every(cfg.connectRate), 1),
 	}
 
@@ -223,6 +210,9 @@ func NewPool(
 	}
 
 	if cfg.balancer != nil {
+		if setter, ok := cfg.balancer.(interface{ setTracer(Tracer) }); ok {
+			setter.setTracer(cfg.tracer)
+		}
 		balancerCtx, cancel := context.WithCancel(context.Background())
 		p.shutdownWG.Go(func() {
 			cfg.balancer.Run(balancerCtx, p)
@@ -338,7 +328,7 @@ type Tx interface {
 // The callback receives the context that should be used for transaction-bound
 // database operations.
 func (p *Pool) InTx(ctx context.Context, txOptions pgx.TxOptions, txFunc func(context.Context, Runner) error) error {
-	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
+	return p.withRetries(ctx, OperationTransaction, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
 		tx, err := conn.BeginTx(ctx, txOptions)
 		if err != nil {
@@ -422,7 +412,7 @@ func (p *Pool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNam
 // ExecFunc executes a SQL command and calls tagFunc with the command result.
 // The operation includes automatic retry logic for retryable and resettable errors.
 func (p *Pool) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, tag pgconn.CommandTag, err error) error, sql string, arguments ...any) error {
-	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
+	return p.withRetries(ctx, OperationExec, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
 		tag, err := conn.Conn().Exec(ctx, sql, arguments...)
 		return tagFunc(ctx, tag, err)
@@ -439,7 +429,7 @@ func (t crdbTx) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, 
 // The operation includes automatic retry logic for retryable and resettable errors.
 // rowsFunc must close the rows when done.
 func (p *Pool) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context, rows pgx.Rows) error, sql string, optionsAndArgs ...any) error {
-	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
+	return p.withRetries(ctx, OperationQuery, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
 		rows, err := conn.Conn().Query(ctx, sql, optionsAndArgs...)
 		if err != nil {
@@ -463,7 +453,7 @@ func (t crdbTx) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context
 // QueryRowFunc executes a SQL query that returns at most one row and calls rowFunc with the result.
 // The operation includes automatic retry logic for retryable and resettable errors.
 func (p *Pool) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Context, row pgx.Row) error, sql string, optionsAndArgs ...any) error {
-	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
+	return p.withRetries(ctx, OperationQueryRow, func(conn *pgxpool.Conn) error {
 		ctx = p.contextForDBOp(ctx)
 		return rowFunc(ctx, conn.Conn().QueryRow(ctx, sql, optionsAndArgs...))
 	})
@@ -482,9 +472,11 @@ func (p *Pool) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	return p.pool.SendBatch(p.contextForDBOp(ctx), b)
 }
 
-// Stat returns statistics about the connection pool.
-func (p *Pool) Stat() *pgxpool.Stat {
-	return p.pool.Stat()
+// Stat returns a point-in-time snapshot of Pool statistics, including native
+// pgx pool statistics and CockroachDB-specific retry, reset, health, and
+// balancer counters.
+func (p *Pool) Stat() Stat {
+	return p.stats.snapshot(p.pool.Stat(), p.health.NumHealthy())
 }
 
 // NodeID returns the CockroachDB node ID for the given connection.
@@ -540,24 +532,33 @@ func (p *Pool) afterConnect(ctx context.Context, conn *pgx.Conn, wrapped afterCo
 	delete(p.nodeForConn, conn)
 	delete(p.gc, conn)
 
-	p.health.SetStatus(nodeID(conn), true)
+	p.setNodeStatus(ctx, nodeID(conn), true)
 	p.nodeForConn[conn] = nodeID(conn)
 
 	return nil
 }
 
-func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (*pgxpool.Conn, error) {
+func (p *Pool) acquireFromDifferentNode(
+	ctx context.Context,
+	currentNodeID uint32,
+) (conn *pgxpool.Conn, err error) {
 	p.logger.DebugContext(ctx, "crdbpgx: acquiring connection from a different node",
 		slog.Uint64("current_node_id", uint64(currentNodeID)),
 	)
 
-	span := trace.SpanFromContext(ctx)
-	span.AddEvent("acquiring connection from different node", trace.WithAttributes(
-		attribute.Int64("current_node_id", int64(currentNodeID)),
-	))
+	tracer := p.lifecycleTracer()
+	ctx = tracer.TraceAcquireFromDifferentNodeStart(ctx, TraceAcquireFromDifferentNodeStartData{
+		PoolName:      p.Name(),
+		CurrentNodeID: currentNodeID,
+	})
+	var endData TraceAcquireFromDifferentNodeEndData
+	defer func() {
+		endData.Err = err
+		tracer.TraceAcquireFromDifferentNodeEnd(ctx, endData)
+	}()
 
 	for {
-		conn, err := p.pool.Acquire(ctx)
+		conn, err = p.pool.Acquire(ctx)
 		if err != nil {
 			if conn != nil {
 				conn.Release()
@@ -570,9 +571,8 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 				slog.Uint64("current_node_id", uint64(currentNodeID)),
 			)
 
-			span.AddEvent("only one healthy node available, reuse connection", trace.WithAttributes(
-				attribute.Int64("current_node_id", int64(currentNodeID)),
-			))
+			endData.NodeID = p.NodeID(conn.Conn())
+			endData.ReusedSameNode = true
 			return conn, nil
 		}
 
@@ -586,46 +586,62 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			slog.Uint64("node_id", uint64(id)),
 		)
 
-		span.AddEvent("acquired connection from different node", trace.WithAttributes(attribute.Int64("node_id", int64(id))))
+		endData.NodeID = id
 		return conn, nil
 	}
 }
 
-func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) error) error {
-	conn, err := p.Acquire(ctx)
-	if err != nil {
-		if conn != nil {
-			conn.Release()
-		}
-		return fmt.Errorf("acquire connection from pool: %w", err)
-	}
+func (p *Pool) withRetries(
+	ctx context.Context,
+	operation Operation,
+	fn func(conn *pgxpool.Conn) error,
+) (err error) {
+	tracer := p.lifecycleTracer()
+	ctx = tracer.TraceOperationStart(ctx, TraceOperationStartData{
+		PoolName:  p.Name(),
+		Operation: operation,
+	})
 
-	var retries, maxRetries uint
+	var retries, resets uint
+	var exhausted bool
+	var conn *pgxpool.Conn
 	defer func() {
 		if conn != nil {
 			conn.Release()
 		}
-		p.metrics.resetHistogram.Record(
-			context.Background(),
-			int64(retries), //nolint:gosec // retries are known to stay within a reasonable range
-			metric.WithAttributes(
-				attribute.String("pool.id", p.Name()),
-			),
-		)
+		p.stats.operations.Add(1)
+		p.stats.retries.Add(uint64(retries))
+		p.stats.resets.Add(uint64(resets))
+		if exhausted {
+			p.stats.maxRetryErrors.Add(1)
+		}
+		tracer.TraceOperationEnd(ctx, TraceOperationEndData{
+			Err:       err,
+			Retries:   retries,
+			Resets:    resets,
+			Exhausted: exhausted,
+		})
 	}()
 
+	conn, err = p.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection from pool: %w", err)
+	}
+
+	var maxRetries uint
 	if !RetriesDisabled(ctx) {
 		if mr := p.maxRetries; mr > 0 {
 			maxRetries = uint(mr)
 		}
 	}
 
-	for retries = 0; retries <= maxRetries; retries++ {
+	for attempt := uint(0); attempt <= maxRetries; attempt++ {
 		err = wrapSQLError(ctx, fn(conn))
 		if err == nil {
 			conn.Release()
+			conn = nil
 			if retries > 0 {
-				p.logger.DebugContext(ctx, "ctdbpgx: successful query after retries",
+				p.logger.DebugContext(ctx, "crdbpgx: successful query after retries",
 					slog.Uint64("retries", uint64(retries)),
 				)
 			}
@@ -643,11 +659,26 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			nodeID := p.NodeID(conn.Conn())
 			p.GCMark(conn.Conn())
 			conn.Release()
+			conn = nil
+			resets++
 
 			// If a resettable error occurred, we mark the node as unhealthy.
 			if nodeID > 0 {
-				p.health.SetStatus(nodeID, false)
+				p.setNodeStatus(ctx, nodeID, false)
 			}
+
+			if attempt == maxRetries {
+				break
+			}
+
+			retries++
+			tracer.TraceRetry(ctx, TraceRetryData{
+				PoolName: p.Name(),
+				Reason:   RetryReasonResettable,
+				Attempt:  retries,
+				NodeID:   nodeID,
+				Err:      err,
+			})
 
 			sleepOnErr(ctx, 0)
 
@@ -660,12 +691,25 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 			p.logger.DebugContext(ctx, "crdbpgx: retryable error",
 				slog.Uint64("retries", uint64(retries)), slog.Any("error", err),
 			)
-			sleepOnErr(ctx, retries)
+			if attempt == maxRetries {
+				break
+			}
+
+			retries++
+			tracer.TraceRetry(ctx, TraceRetryData{
+				PoolName: p.Name(),
+				Reason:   RetryReasonRetryable,
+				Attempt:  retries,
+				NodeID:   p.NodeID(conn.Conn()),
+				Err:      err,
+			})
+			sleepOnErr(ctx, retries-1)
 			continue
 		}
 
 		// The error is not resettable or retry-able, return it
 		conn.Release()
+		conn = nil
 
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			p.logger.DebugContext(ctx, "crdbpgx: non-retryable error",
@@ -677,10 +721,28 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		return err
 	}
 	// If we arrive here, the maximum retries threshold have been reached
+	exhausted = true
 	return &MaxRetryError{
 		MaxRetries: maxRetries,
 		LastErr:    err,
 	}
+}
+
+func (p *Pool) lifecycleTracer() Tracer {
+	if p.tracer == nil {
+		return NopTracer{}
+	}
+	return p.tracer
+}
+
+func (p *Pool) setNodeStatus(ctx context.Context, nodeID uint32, healthy bool) {
+	if tracker, ok := p.health.(interface {
+		SetStatusContext(context.Context, uint32, bool)
+	}); ok {
+		tracker.SetStatusContext(ctx, nodeID, healthy)
+		return
+	}
+	p.health.SetStatus(nodeID, healthy)
 }
 
 func sleepOnErr(ctx context.Context, retries uint) {

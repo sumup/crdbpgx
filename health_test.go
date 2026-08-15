@@ -2,6 +2,7 @@ package crdbpgx_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,28 @@ import (
 
 	"github.com/sumup/crdbpgx"
 )
+
+type healthTraceRecorder struct {
+	crdbpgx.NopTracer
+
+	mu      sync.Mutex
+	changes []crdbpgx.TraceNodeHealthChangeData
+}
+
+func (r *healthTraceRecorder) TraceNodeHealthChange(
+	_ context.Context,
+	data crdbpgx.TraceNodeHealthChangeData,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.changes = append(r.changes, data)
+}
+
+func (r *healthTraceRecorder) snapshot() []crdbpgx.TraceNodeHealthChangeData {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]crdbpgx.TraceNodeHealthChangeData(nil), r.changes...)
+}
 
 func TestNodeHealthTracker(t *testing.T) {
 	t.Parallel()
@@ -43,6 +66,28 @@ func TestNodeHealthTracker(t *testing.T) {
 		require.False(tracker.IsHealthy(1))
 		require.True(tracker.IsHealthy(2))
 		require.Equal(1, tracker.NumHealthy())
+	})
+
+	t.Run("traces health transitions", func(t *testing.T) {
+		t.Parallel()
+
+		tracer := new(healthTraceRecorder)
+		tracker, err := crdbpgx.NewNodeHealthTracker(
+			&pgx.ConnConfig{},
+			crdbpgx.WithNodeHealthTracer(tracer),
+		)
+		require.NoError(t, err)
+
+		tracker.SetStatusContext(t.Context(), 1, true)
+		tracker.SetStatusContext(t.Context(), 1, true)
+		tracker.SetStatusContext(t.Context(), 1, false)
+		tracker.SetStatusContext(t.Context(), 1, false)
+		tracker.SetStatusContext(t.Context(), 1, false)
+
+		require.Equal(t, []crdbpgx.TraceNodeHealthChangeData{
+			{NodeID: 1, Healthy: true, HealthyNodes: 1},
+			{NodeID: 1, Healthy: false, HealthyNodes: 0},
+		}, tracer.snapshot())
 	})
 
 	t.Run("notifies topology changes when healthy node becomes unhealthy", func(t *testing.T) {

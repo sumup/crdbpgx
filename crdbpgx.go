@@ -26,6 +26,14 @@
 // [Pool.Close] starts shutdown once and waits for internal goroutines and the
 // underlying pgx pool to finish closing.
 //
+// # Instrumentation
+//
+// The core package has no telemetry backend assumptions. [Pool.Stat] exposes
+// native pgx pool statistics together with CockroachDB-specific retry, reset,
+// health, and balancer statistics, and [WithTracer] installs a lifecycle
+// tracer. Use the crdbotel or crdbprom subpackage to export those signals to
+// OpenTelemetry or Prometheus.
+//
 // # Context propagation
 //
 // Database operation contexts can affect connection health in pgx: canceling a
@@ -72,9 +80,3 @@
 //		return fmt.Errorf("transfer funds: %w", err)
 //	}
 package crdbpgx
-
-import "go.opentelemetry.io/otel"
-
-var (
-	meter = otel.Meter("github.com/sumup/crdbpgx")
-)

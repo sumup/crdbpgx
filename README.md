@@ -83,6 +83,51 @@ When used with the built-in health tracker, the balancer also reacts to topology
 
 If you need manual lifecycle control, create a balancer with `NewNodeConnectionBalancer`, call `Run(ctx, pool)` in your own goroutine for the periodic loop, or call `Rebalance(ctx, pool)` to perform a single balancing operation.
 
+## Instrumentation
+
+The core `crdbpgx` package does not initialize or depend on a telemetry backend. It exposes native pgx and CockroachDB-specific statistics through `Pool.Stat()`, and typed retry, node-health, node-selection, and balancer lifecycle hooks through `WithTracer`.
+
+### OpenTelemetry
+
+[`crdbotel`](https://pkg.go.dev/github.com/sumup/crdbpgx/crdbotel) directly implements pgx query, batch, copy, prepare, connect, and acquire tracing, and adds crdbpgx lifecycle spans and events. It emits the standard `db.client.operation.duration`, `db.client.connection.*` instruments and semantic-convention attributes; implementation-specific metrics and attributes use the `crdbpgx` namespace.
+
+```go
+tracer := crdbotel.NewTracer(
+  crdbotel.WithDisableSQLStatementInAttributes(),
+)
+
+pool, err := crdbpgx.NewPool(
+  ctx,
+  cfg,
+  crdbpgx.WithName("orders"),
+  crdbpgx.WithTracer(tracer),
+)
+if err != nil {
+  return fmt.Errorf("create pool: %w", err)
+}
+
+if err := crdbotel.RecordStats(pool); err != nil {
+  pool.Close()
+  return fmt.Errorf("record pool stats: %w", err)
+}
+```
+
+`WithTracer` automatically installs a compatible tracer on the pgx connection configuration when no pgx tracer is already configured. Parameterized query text is captured by default, while non-parameterized query text, query parameter values, and row counts are omitted. `WithIncludeSQLStatementInAttributes` opts into all query text; only use it or `WithIncludeQueryParameters` after confirming the data cannot contain secrets or personal data. `WithRowCountsInAttributes` enables returned and affected row counts.
+
+### Prometheus
+
+[`crdbprom`](https://pkg.go.dev/github.com/sumup/crdbpgx/crdbprom) implements `prometheus.Collector` and exposes the same native pgx and CRDB-specific statistics. The pool name is included as the `pool` label by default.
+
+```go
+collector := crdbprom.NewCollector(
+  pool,
+  crdbprom.WithLabels(prometheus.Labels{"role": "primary"}),
+)
+prometheus.MustRegister(collector)
+```
+
+Both adapters expose connection-pool utilization and saturation plus cumulative operation, retry, reset, retry-exhaustion, and balancer counters. OTel uses `db.system.name=cockroachdb` and `db.client.connection.pool.name`; Prometheus uses the `crdbpgx_*` namespace by default.
+
 ## Credits
 
 - [jackc/pgx](https://github.com/jackc/pgx)

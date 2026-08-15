@@ -2,14 +2,12 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/time/rate"
 )
 
@@ -26,29 +24,6 @@ const (
 	// defaultNodeHealthCloseTimeout bounds cleanup of probe connections.
 	defaultNodeHealthCloseTimeout = 5 * time.Second
 )
-
-var (
-	newNodeHealthTrackerMetricsOnce = sync.OnceValue(newNodeHealthTrackerMetrics)
-)
-
-type healthTrackerMetrics struct {
-	// healthyNodesGauge records the current healthy node count.
-	healthyNodesGauge metric.Int64Gauge
-}
-
-func newNodeHealthTrackerMetrics() *healthTrackerMetrics {
-	healthyCRDBNodeCountGauge, err := meter.Int64Gauge(
-		"crdb_healthy_nodes",
-		metric.WithDescription("Number of healthy CRDB nodes detected"),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb health nodes gauge: %w", err))
-	}
-
-	return &healthTrackerMetrics{
-		healthyNodesGauge: healthyCRDBNodeCountGauge,
-	}
-}
 
 // NodeHealthTracker is responsible for tracking health of a nodes
 // in a CockroachDB cluster.
@@ -82,8 +57,8 @@ type nodeHealthTracker struct {
 	// pollInterval is the regular health probe interval.
 	pollInterval time.Duration
 
-	// metrics contains shared health tracker metric instruments.
-	metrics *healthTrackerMetrics
+	// tracer observes node health transitions.
+	tracer Tracer
 
 	// topologyChangePollInterval is the accelerated probe interval.
 	topologyChangePollInterval time.Duration
@@ -102,6 +77,8 @@ type nodeHealthTrackerConfig struct {
 	topologyChangePollInterval time.Duration
 	// topologyChangePollWindow configures the accelerated probing duration.
 	topologyChangePollWindow time.Duration
+	// tracer observes node health transitions.
+	tracer Tracer
 }
 
 // NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
@@ -130,6 +107,17 @@ func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTr
 	}
 }
 
+// WithNodeHealthTracer configures a tracer for node health transitions.
+// A Pool configured with [WithTracer] injects its tracer into the built-in
+// health tracker automatically.
+func WithNodeHealthTracer(tracer Tracer) NodeHealthTrackerOption {
+	return func(tracker *nodeHealthTrackerConfig) {
+		if tracer != nil {
+			tracker.tracer = tracer
+		}
+	}
+}
+
 // NewNodeHealthTracker creates a new [nodeHealthTracker].
 //
 // The tracker periodically probes for healthy nodes in the CockroachDB cluster
@@ -139,6 +127,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		pollInterval:               defaultNodeHealthPollInterval,
 		topologyChangePollInterval: defaultTopologyChangeNodeHealthPollInterval,
 		topologyChangePollWindow:   defaultTopologyChangeNodeHealthPollIntervalWindow,
+		tracer:                     NopTracer{},
 	}
 	for _, o := range opts {
 		o(tCfg)
@@ -151,7 +140,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		topologyChangePollWindow:   tCfg.topologyChangePollWindow,
 		healthyNodes:               make(map[uint32]struct{}),
 		nodesSeen:                  make(map[uint32]*rate.Limiter),
-		metrics:                    newNodeHealthTrackerMetricsOnce(),
+		tracer:                     tCfg.tracer,
 		topologyChangeSubscribers:  make([]chan struct{}, 0),
 		newLimiter: func() *rate.Limiter {
 			return rate.NewLimiter(rate.Every(1*time.Minute), 2)
@@ -217,7 +206,7 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 	)
 
 	// Connection successful --> mark node health
-	t.SetStatus(nodeID(conn), true)
+	t.SetStatusContext(ctx, nodeID(conn), true)
 }
 
 // SetStatus updates the health status of a node.
@@ -226,6 +215,12 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 // as unhealthy only if it has failed more than twice in the last minute (rate limited
 // to prevent marking nodes as unhealthy due to transient errors).
 func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
+	t.SetStatusContext(context.Background(), nodeID, healthy)
+}
+
+// SetStatusContext updates the health status of a node and propagates ctx to
+// lifecycle tracing. It otherwise has the same behavior as SetStatus.
+func (t *nodeHealthTracker) SetStatusContext(ctx context.Context, nodeID uint32, healthy bool) {
 	t.mu.Lock()
 
 	nodeLimiter, nodeHasBeenSeen := t.nodesSeen[nodeID]
@@ -241,7 +236,13 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 		t.nodesSeen[nodeID] = t.newLimiter()
 		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+		if !wasHealthy {
+			t.lifecycleTracer().TraceNodeHealthChange(ctx, TraceNodeHealthChangeData{
+				NodeID:       nodeID,
+				Healthy:      true,
+				HealthyNodes: numHealthy,
+			})
+		}
 		if !wasHealthy && hadHealthyNodes {
 			t.notifyTopologyChange()
 		}
@@ -251,9 +252,7 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	// If the limiter allows the request, we haven't seen more than 2 failures in the past minute.
 	// Keep the node health
 	if nodeLimiter.Allow() {
-		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
 		return
 	}
 
@@ -262,10 +261,31 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	numHealthy := len(t.healthyNodes)
 	t.mu.Unlock()
 
-	t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
 	if wasHealthy {
+		t.lifecycleTracer().TraceNodeHealthChange(ctx, TraceNodeHealthChangeData{
+			NodeID:       nodeID,
+			Healthy:      false,
+			HealthyNodes: numHealthy,
+		})
 		t.notifyTopologyChange()
 	}
+}
+
+func (t *nodeHealthTracker) setTracer(tracer Tracer) {
+	if tracer != nil {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.tracer = tracer
+	}
+}
+
+func (t *nodeHealthTracker) lifecycleTracer() Tracer {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.tracer == nil {
+		return NopTracer{}
+	}
+	return t.tracer
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.
