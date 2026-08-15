@@ -191,18 +191,6 @@ func NewPool(
 		return pruneConnectionIfMarked(c), nil
 	}
 
-	//nolint:staticcheck // Supporting for migration period
-	beforeAcquire := pgxConfig.BeforeAcquire
-	//nolint:staticcheck // Supporting for migration period
-	pgxConfig.BeforeAcquire = func(ctx context.Context, c *pgx.Conn) bool {
-		if beforeAcquire != nil {
-			if !beforeAcquire(ctx, c) {
-				return false
-			}
-		}
-		return pruneConnectionIfMarked(c)
-	}
-
 	afterRelease := pgxConfig.AfterRelease
 	pgxConfig.AfterRelease = func(c *pgx.Conn) bool {
 		if afterRelease != nil {
