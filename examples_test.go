@@ -37,7 +37,7 @@ func ExampleNewPool() {
 
 func ExamplePool_InTx() {
 	transferFunds := func(ctx context.Context, pool *crdbpgx.Pool, accountID string, amount int64) error {
-		return pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db crdbpgx.Runner) error {
+		return pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db crdbpgx.Tx) error {
 			return db.ExecFunc(
 				ctx,
 				func(_ context.Context, _ pgconn.CommandTag, err error) error {
