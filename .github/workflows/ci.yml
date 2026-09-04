@@ -30,7 +30,7 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: golangci-lint
-        uses: reviewdog/action-actionlint@d63ba7532e0942965320cd8d73cbae4c7b3c5283 # v1.73.1
+        uses: reviewdog/action-actionlint@49cb3ce06e5d81452e14b38ad34e4b12a8acfe2b # v1.73.3
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
 
