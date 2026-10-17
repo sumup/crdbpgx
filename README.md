@@ -59,7 +59,7 @@ func main() {
 }
 ```
 
-## Typed queries and transactions
+## Typed Queries and Transactions
 
 `Pool` embeds a concrete `Runner`, so typed queries and commands are available
 as `pool.Query`, `pool.QueryRow`, and `pool.Exec` on Go 1.27+:
@@ -157,6 +157,8 @@ defer pool.Close()
 Metrics and tracing can be enabled independently or combined with other observers. For example, `WithHooks(prometheusMeter, crdbotel.NewTracer())` combines native Prometheus metrics with OpenTelemetry query spans and failover events. Query hooks are automatically composed with any existing `cfg.ConnConfig.Tracer`.
 
 `crdbotel.NewTracer(crdbotel.WithTracerProvider(provider))` selects a provider for query spans. Without an explicit provider, the global OpenTelemetry tracer provider is used.
+
+`crdbotel.NewMeter()` automatically registers pool statistics through `WithHooks` and unregisters them on `pool.Close()`. Use a unique `WithName` for each pool. Statistics include idle and acquired connections (`db.client.connection.count`, with `idle` and `used` states), the pool limit (`db.client.connection.max`), and `crdbpgx.pool.*` metrics for connections being constructed, successful/canceled acquisitions, acquisitions that waited, new connections, and connections destroyed due to lifetime or idle limits. All carry `db.client.connection.pool.name` and any `WithMeterAttributes` attributes. Acquisition duration and wait duration are cumulative seconds for successful acquisitions. pgx does not expose the number of pending acquisitions or separate timeouts from other cancellations, so those metrics are not emitted.
 
 Pool hooks also cover the built-in balancer and automatically created health tracker. For a caller-created or shared tracker, configure instrumentation with `WithHealthTrackerHooks` and pass the tracker to each pool with `WithHealthTracker`:
 

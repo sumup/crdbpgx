@@ -50,9 +50,11 @@ func WithMeterAttributes(attrs ...attribute.KeyValue) MeterOption {
 // Meter records query/batch durations and errors, retries, balancing, and health.
 // Construct it with [NewMeter] and register it with [crdbpgx.WithHooks]. It is safe
 // to share across pools. A caller-owned health tracker uses [crdbpgx.WithHealthTrackerHooks].
+// Connection pool statistics are registered automatically and removed on Pool.Close.
 type Meter struct {
 	// HooksDefaults supplies no-op callbacks for events this meter does not record.
 	crdbpgx.HooksDefaults
+	meter metric.Meter
 
 	resets       metric.Int64Histogram
 	acquired     metric.Int64Histogram
@@ -139,6 +141,7 @@ func NewMeter(opts ...MeterOption) *Meter {
 	}
 
 	return &Meter{
+		meter:  meter,
 		resets: resets, acquired: acquired, pruned: pruned, healthyNodes: healthyNodes,
 		attributes: attribute.NewSet(cfg.attributes...),
 		duration:   duration.Inst(), errors: operationErrors,

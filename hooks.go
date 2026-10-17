@@ -22,6 +22,12 @@ type Hook interface {
 	// contexts flow through subsequent hooks and into query end callbacks.
 	pgx.QueryTracer
 
+	// OnPoolCreated runs once after the underlying pool is initialized, before
+	// NewPool returns. The returned cleanup, if non-nil, runs once on Close,
+	// before the underlying pool is closed. It must stop any registered observers.
+	// Neither callback may close the pool.
+	OnPoolCreated(*Pool) func()
+
 	// OnOperationEnd observes retry-managed operations after their connections
 	// have been released, including when initial acquisition fails.
 	OnOperationEnd(context.Context, OperationEndData)
@@ -47,6 +53,9 @@ type Hook interface {
 type HooksDefaults struct{}
 
 var _ Hook = HooksDefaults{}
+
+// OnPoolCreated implements [Hook] without registering any observers.
+func (HooksDefaults) OnPoolCreated(*Pool) func() { return nil }
 
 // TraceQueryStart implements [pgx.QueryTracer] by returning ctx unchanged.
 func (HooksDefaults) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {

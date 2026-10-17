@@ -209,6 +209,12 @@ func NewPool(
 		return nil, fmt.Errorf("create crdbpgx.Pool from config: %w", err)
 	}
 
+	for _, hook := range p.hooks {
+		if cleanup := hook.OnPoolCreated(p); cleanup != nil {
+			p.onShutdown = append(p.onShutdown, cleanup)
+		}
+	}
+
 	if cfg.balancer != nil {
 		balancerCtx, cancel := context.WithCancel(context.Background())
 		p.shutdownWG.Go(func() {
