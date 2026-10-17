@@ -205,3 +205,34 @@ func TestTracer_SpanEvents(t *testing.T) {
 	assert.Equal(t, "only one healthy node available, reuse connection", events[3].Name)
 	assert.Equal(t, []attribute.KeyValue{attribute.Int64("current_node_id", 2)}, events[3].Attributes)
 }
+
+func TestTracer_BatchSpans(t *testing.T) {
+	t.Parallel()
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() {
+		require.NoError(t, provider.Shutdown(context.Background()))
+	})
+	tracer := crdbotel.NewTracer(crdbotel.WithTracerProvider(provider))
+
+	batch := &pgx.Batch{}
+	batch.Queue("SELECT $1", 1)
+	batch.Queue("SELECT $1", 2)
+	ctx := tracer.TraceBatchStart(t.Context(), nil, pgx.TraceBatchStartData{Batch: batch})
+	batchID := trace.SpanFromContext(ctx).SpanContext().SpanID()
+
+	tracer.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{SQL: "SELECT $1", Args: []any{1}})
+	tracer.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{SQL: "SELECT $1", Args: []any{2}, Err: assert.AnError})
+	require.Len(t, recorder.Ended(), 2, "batch span stays open until results are closed")
+
+	tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{Err: assert.AnError})
+	spans := recorder.Ended()
+	require.Len(t, spans, 3)
+	assert.Equal(t, batchID, spans[0].Parent().SpanID())
+	assert.Equal(t, batchID, spans[1].Parent().SpanID())
+	assert.Equal(t, codes.Error, spans[1].Status().Code)
+	assert.Equal(t, "BATCH cockroachdb", spans[2].Name())
+	assert.Equal(t, codes.Error, spans[2].Status().Code)
+	assert.Contains(t, spans[2].Attributes(), attribute.Int("db.operation.batch.size", 2))
+}

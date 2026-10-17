@@ -103,7 +103,7 @@ func WithIncludeQueryParameters(filter ...QueryParametersFilterFunc) TracerOptio
 	}
 }
 
-// Tracer creates query spans and adds failover events to the caller's span.
+// Tracer creates query and batch spans and adds failover events to the caller's span.
 // It creates no metrics and is safe to share across pools. Its zero value uses
 // the global OpenTelemetry tracer provider.
 type Tracer struct {
@@ -115,8 +115,11 @@ type Tracer struct {
 }
 
 type querySpanKey struct{ tracer *Tracer }
+type batchSpanKey struct{ tracer *Tracer }
 
 var _ crdbpgx.Hook = (*Tracer)(nil)
+var _ pgx.BatchTracer = (*Tracer)(nil)
+var _ pgx.QueryTracer = (*Tracer)(nil)
 
 // NewTracer creates query and failover tracing for [crdbpgx.WithHooks]. Each
 // Exec, Query, and QueryRow attempt gets a client span. Query spans end when pgx
@@ -192,21 +195,72 @@ func (t *Tracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQ
 	if !ok {
 		return
 	}
+	finishSpan(span, data.Err)
+}
+
+// TraceBatchStart starts one client span for SendBatch, ending when its results
+// are closed. The aggregate span contains no SQL text or parameter values.
+func (t *Tracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	tracer := t.tracer
+	if tracer == nil {
+		tracer = otel.Tracer("github.com/sumup/crdbpgx", trace.WithSchemaURL(semconv.SchemaURL))
+	}
+	var cfg *pgx.ConnConfig
+	if conn != nil && !t.config.disableConnectionDetails {
+		cfg = conn.Config()
+	}
+	name, attrs := querySpanAttributes(cfg)
+	attrs = append(slices.Clone(t.config.attributes), attrs...)
+	attrs = append(attrs, semconv.DBQuerySummary("BATCH"))
+	if data.Batch != nil {
+		attrs = append(attrs, semconv.DBOperationBatchSize(len(data.Batch.QueuedQueries)))
+	}
+	ctx, span := tracer.Start(ctx, "BATCH "+name, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	return context.WithValue(ctx, batchSpanKey{t}, span)
+}
+
+// TraceBatchQuery creates a child span for a completed batch statement, using
+// the same naming and SQL privacy options as ordinary queries. pgx only reports
+// statement completion, so these spans do not measure statement execution time.
+func (t *Tracer) TraceBatchQuery(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchQueryData) {
+	span, ok := ctx.Value(batchSpanKey{t}).(trace.Span)
+	if !ok {
+		return
+	}
+	ctx = trace.ContextWithSpan(ctx, span)
+	ctx = t.TraceQueryStart(ctx, conn, pgx.TraceQueryStartData{SQL: data.SQL, Args: data.Args})
+	t.TraceQueryEnd(ctx, conn, pgx.TraceQueryEndData{CommandTag: data.CommandTag, Err: data.Err})
+}
+
+// TraceBatchEnd completes this tracer's aggregate batch span.
+func (t *Tracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
+	if span, ok := ctx.Value(batchSpanKey{t}).(trace.Span); ok {
+		finishSpan(span, data.Err)
+	}
+}
+
+func finishSpan(span trace.Span, err error) {
 	defer span.End()
-	if data.Err != nil && !errors.Is(data.Err, pgx.ErrNoRows) {
-		cause := data.Err
-		for unwrapped := errors.Unwrap(cause); unwrapped != nil; unwrapped = errors.Unwrap(cause) {
-			cause = unwrapped
-		}
-		errorType := fmt.Sprintf("%T", cause)
-		var pgErr *pgconn.PgError
-		if errors.As(data.Err, &pgErr) && pgErr.Code != "" {
-			errorType = pgErr.Code
-			span.SetAttributes(semconv.DBResponseStatusCode(pgErr.Code))
-		}
-		span.SetAttributes(semconv.ErrorTypeKey.String(errorType))
+	if attrs := operationErrorAttributes(err); len(attrs) > 0 {
+		span.SetAttributes(attrs...)
 		span.SetStatus(codes.Error, "")
 	}
+}
+
+// operationErrorAttributes is shared by spans and metrics so error classification
+// remains consistent, including when tracing is disabled or unsampled.
+func operationErrorAttributes(err error) []attribute.KeyValue {
+	if err == nil || errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code != "" {
+		return []attribute.KeyValue{semconv.ErrorTypeKey.String(pgErr.Code), semconv.DBResponseStatusCode(pgErr.Code)}
+	}
+	cause := err
+	for unwrapped := errors.Unwrap(cause); unwrapped != nil; unwrapped = errors.Unwrap(cause) {
+		cause = unwrapped
+	}
+	return []attribute.KeyValue{semconv.ErrorTypeKey.String(fmt.Sprintf("%T", cause))}
 }
 
 // querySpanAttributes uses the SQL fallback span name: namespace, server

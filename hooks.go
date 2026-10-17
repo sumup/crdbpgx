@@ -14,6 +14,8 @@ import (
 // run concurrently. They must be safe for concurrent use, return promptly, and
 // must not close the pool. Contexts retain caller values when cancellation is
 // detached by the pool's context propagation policy.
+// Hooks may also implement [pgx.BatchTracer] to observe SendBatch; these
+// callbacks are discovered automatically and composed with existing tracers.
 type Hook interface {
 	// QueryTracer observes individual Exec, Query, and QueryRow attempts through
 	// pgx, including operations on directly acquired connections. Query start

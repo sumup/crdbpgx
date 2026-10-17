@@ -3,7 +3,10 @@ package crdbotel_test
 import (
 	"context"
 	"testing"
+	"testing/synctest"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -139,4 +142,84 @@ func TestMeter_Attributes(t *testing.T) {
 		attribute.String("cluster", "production"),
 		attribute.String("component", "database"),
 	)
+}
+
+func newTestMeter(t *testing.T) (*crdbotel.Meter, *sdkmetric.ManualReader) {
+	t.Helper()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		require.NoError(t, provider.Shutdown(context.Background()))
+	})
+
+	return crdbotel.NewMeter(crdbotel.WithMeterProvider(provider)), reader
+}
+
+func collectMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]metricdata.Metrics {
+	t.Helper()
+
+	var resource metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &resource))
+
+	result := make(map[string]metricdata.Metrics)
+	for _, scope := range resource.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			result[m.Name] = m
+		}
+	}
+	return result
+}
+
+func TestMeter_QueryMetrics(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		meter, reader := newTestMeter(t)
+
+		// Query metrics work without a tracing provider or recorded spans.
+		for _, err := range []error{nil, assert.AnError} {
+			ctx := meter.TraceQueryStart(t.Context(), nil, pgx.TraceQueryStartData{})
+			time.Sleep(time.Second)
+			meter.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: err})
+		}
+
+		metrics := collectMetrics(t, reader)
+		duration := metrics["db.client.operation.duration"]
+		assert.Equal(t, "s", duration.Unit)
+		points := duration.Data.(metricdata.Histogram[float64]).DataPoints
+		require.Len(t, points, 2)
+		for _, point := range points {
+			assert.Equal(t, uint64(1), point.Count)
+			assert.Equal(t, float64(1), point.Sum)
+		}
+
+		errors := metrics["db.client.operation.errors"].Data.(metricdata.Sum[int64]).DataPoints
+		require.Len(t, errors, 1)
+		assert.Equal(t, int64(1), errors[0].Value)
+	})
+}
+
+func TestMeter_BatchMetrics(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		meter, reader := newTestMeter(t)
+		ctx := meter.TraceBatchStart(t.Context(), nil, pgx.TraceBatchStartData{})
+		time.Sleep(time.Second)
+		meter.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{Err: assert.AnError})
+		meter.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{Err: assert.AnError})
+		meter.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{Err: assert.AnError})
+
+		// pgx can report the same failure from SendBatch and BatchResults.Close.
+		metrics := collectMetrics(t, reader)
+		points := metrics["db.client.operation.duration"].Data.(metricdata.Histogram[float64]).DataPoints
+		require.Len(t, points, 1)
+		assert.Equal(t, uint64(1), points[0].Count)
+		assert.Equal(t, float64(1), points[0].Sum)
+
+		errors := metrics["db.client.operation.errors"].Data.(metricdata.Sum[int64]).DataPoints
+		require.Len(t, errors, 1)
+		assert.Equal(t, int64(1), errors[0].Value)
+	})
 }
