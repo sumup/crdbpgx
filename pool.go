@@ -10,37 +10,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/multitracer"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 )
-
-var (
-	newPoolMetricsOnce = sync.OnceValue(newPoolMetrics)
-)
-
-type poolMetrics struct {
-	// resetHistogram records retry reset counts for completed operations.
-	resetHistogram metric.Int64Histogram
-}
-
-func newPoolMetrics() *poolMetrics {
-	resetHistogram, err := meter.Int64Histogram(
-		"crdbpgx.resets",
-		metric.WithDescription("CockroachDB client-side transaction reset distribution"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb client resets histogram: %w", err))
-	}
-
-	return &poolMetrics{
-		resetHistogram: resetHistogram,
-	}
-}
 
 // Pool is a CockroachDB-aware connection pool that wraps [pgxpool.Pool] with
 // automatic retry logic, node health tracking, and optional connection
@@ -86,8 +60,8 @@ type Pool struct {
 	// closeOnce makes Pool.Close idempotent.
 	closeOnce sync.Once
 
-	// metrics contains shared pool metric instruments.
-	metrics *poolMetrics
+	// hooks observes pool lifecycle events.
+	hooks hooks
 
 	// connectLimiter applies a rate limit for connection attempts
 	connectLimiter *rate.Limiter
@@ -102,13 +76,10 @@ var (
 // The pool wraps [pgxpool.Pool] and adds CockroachDB-specific features including
 // automatic retry logic, node health tracking, and optional connection rebalancing.
 //
-// Parameters:
-//   - ctx: Context for pool initialization
-//   - pgxConfig: pgxpool configuration (a copy will be made internally)
-//   - healthTracker: Node health tracker for monitoring CockroachDB node status
-//   - opts: Optional configuration options (see [Option] functions)
-//
-// Returns an error if the configuration is invalid or pool creation fails.
+// NewPool copies pgxConfig before applying options. ctx controls initialization;
+// the pool stops its background work when [Pool.Close] is called.
+// Use [WithHealthTracker] to share a caller-owned health tracker across pools.
+// NewPool returns an error if the configuration is invalid or pool creation fails.
 func NewPool(
 	ctx context.Context,
 	pgxConfig *pgxpool.Config,
@@ -125,13 +96,24 @@ func NewPool(
 		return nil, fmt.Errorf("maxRetries must be greater than or equal to 0 (got: %d)", cfg.maxRetries)
 	}
 
+	if len(cfg.hooks) > 0 {
+		tracers := make([]pgx.QueryTracer, 0, len(cfg.hooks)+1)
+		for _, hook := range cfg.hooks {
+			tracers = append(tracers, hook)
+		}
+		if pgxConfig.ConnConfig.Tracer != nil {
+			tracers = append(tracers, pgxConfig.ConnConfig.Tracer)
+		}
+		pgxConfig.ConnConfig.Tracer = multitracer.New(tracers...)
+	}
+
 	// if no custom health tracker was provided we bootstrap one for this
 	// pool automatically
 	healthTracker := cfg.healthTracker
 	var onShutdown []func()
 	shutdownWG := new(sync.WaitGroup)
 	if healthTracker == nil {
-		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig)
+		nodeHealthTracker, err := NewNodeHealthTracker(pgxConfig.ConnConfig, WithHealthTrackerHooks(cfg.hooks...))
 		if err != nil {
 			return nil, fmt.Errorf("new node health tracker: %w", err)
 		}
@@ -155,7 +137,7 @@ func NewPool(
 		logger:         cmp.Or(cfg.logger, slog.Default()),
 		onShutdown:     onShutdown,
 		shutdownWG:     shutdownWG,
-		metrics:        newPoolMetricsOnce(),
+		hooks:          cfg.hooks,
 		connectLimiter: rate.NewLimiter(rate.Every(cfg.connectRate), 1),
 	}
 
@@ -311,10 +293,17 @@ func (p *Pool) Ping(ctx context.Context) error {
 // This is the main abstraction for application code that should work both inside
 // and outside of a transaction without relying on context-carried transaction state.
 type Runner interface {
+	// ExecFunc executes SQL and passes its command tag and error to tagFunc.
+	// The callback's error determines whether the operation succeeds or is retried.
 	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
+	// QueryFunc executes SQL and passes its rows to rowsFunc. It closes the rows
+	// when the callback returns. Query errors are returned without calling rowsFunc.
 	QueryFunc(ctx context.Context, rowsFunc func(context.Context, pgx.Rows) error, sql string, optionsAndArgs ...any) error
+	// QueryRowFunc executes SQL and passes a row to rowFunc. The callback must
+	// call Scan to consume the result and release the connection's query resources.
 	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
-	// InTxFunc ignores [pgx.TxOptions] when invoked as a nested (pseudo) transaction.
+	// InTxFunc runs a callback in a transaction, committing on success and rolling
+	// back on error. Nested calls use savepoints and ignore [pgx.TxOptions].
 	InTxFunc(context.Context, pgx.TxOptions, func(Tx) error) error
 }
 
@@ -324,7 +313,9 @@ type Runner interface {
 // on [Pool] such that users can use the same set of functions both outside and inside
 // a transaction (ExecFunc, QueryFunc, QueryRowFunc, InTxFunc).
 type Tx interface {
+	// Tx provides pgx's transaction operations.
 	pgx.Tx
+	// Runner provides the callback-based query and transaction methods.
 	Runner
 }
 
@@ -369,6 +360,7 @@ func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc fun
 	})
 }
 
+// InTxFunc runs fn in a nested transaction using a savepoint.
 func (t crdbTx) InTxFunc(
 	ctx context.Context,
 	_ pgx.TxOptions,
@@ -534,27 +526,35 @@ func (p *Pool) afterConnect(ctx context.Context, conn *pgx.Conn, wrapped afterCo
 		return err
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	delete(p.nodeForConn, conn)
-	delete(p.gc, conn)
-
 	p.health.SetStatus(nodeID(conn), true)
+
+	p.mu.Lock()
 	p.nodeForConn[conn] = nodeID(conn)
+	delete(p.gc, conn)
+	p.mu.Unlock()
 
 	return nil
 }
 
-func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (*pgxpool.Conn, error) {
+func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint32) (replacement *pgxpool.Conn, err error) {
+	data := NodeSwitchEndData{
+		PoolName:   p.Name(),
+		FromNodeID: currentNodeID,
+	}
+	p.hooks.onNodeSwitchStart(ctx, NodeSwitchStartData{
+		PoolName:   p.Name(),
+		FromNodeID: currentNodeID,
+	})
+	defer func() {
+		data.Err = err
+		if replacement != nil {
+			data.ToNodeID = p.NodeID(replacement.Conn())
+		}
+		p.hooks.onNodeSwitchEnd(ctx, data)
+	}()
 	p.logger.DebugContext(ctx, "crdbpgx: acquiring connection from a different node",
 		slog.Uint64("current_node_id", uint64(currentNodeID)),
 	)
-
-	span := trace.SpanFromContext(ctx)
-	span.AddEvent("acquiring connection from different node", trace.WithAttributes(
-		attribute.Int64("current_node_id", int64(currentNodeID)),
-	))
 
 	for {
 		conn, err := p.pool.Acquire(ctx)
@@ -570,9 +570,7 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 				slog.Uint64("current_node_id", uint64(currentNodeID)),
 			)
 
-			span.AddEvent("only one healthy node available, reuse connection", trace.WithAttributes(
-				attribute.Int64("current_node_id", int64(currentNodeID)),
-			))
+			data.Reused = true
 			return conn, nil
 		}
 
@@ -586,12 +584,17 @@ func (p *Pool) acquireFromDifferentNode(ctx context.Context, currentNodeID uint3
 			slog.Uint64("node_id", uint64(id)),
 		)
 
-		span.AddEvent("acquired connection from different node", trace.WithAttributes(attribute.Int64("node_id", int64(id))))
 		return conn, nil
 	}
 }
 
-func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) error) error {
+func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) error) (err error) {
+	data := OperationEndData{PoolName: p.Name()}
+	defer func() {
+		data.Retries = max(data.Attempts-1, 0)
+		data.Err = err
+		p.hooks.onOperationEnd(ctx, data)
+	}()
 	conn, err := p.Acquire(ctx)
 	if err != nil {
 		if conn != nil {
@@ -605,13 +608,6 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if conn != nil {
 			conn.Release()
 		}
-		p.metrics.resetHistogram.Record(
-			context.Background(),
-			int64(retries), //nolint:gosec // retries are known to stay within a reasonable range
-			metric.WithAttributes(
-				attribute.String("pool.id", p.Name()),
-			),
-		)
 	}()
 
 	if !RetriesDisabled(ctx) {
@@ -621,6 +617,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 	}
 
 	for retries = 0; retries <= maxRetries; retries++ {
+		data.Attempts++
 		err = wrapSQLError(ctx, fn(conn))
 		if err == nil {
 			conn.Release()
@@ -640,6 +637,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 		if errors.As(err, &resettableErr) || conn.Conn().IsClosed() {
 			p.logger.DebugContext(ctx, "crdbpgx: resetting connection", slog.Uint64("retries", uint64(retries)))
 
+			data.Resets++
 			nodeID := p.NodeID(conn.Conn())
 			p.GCMark(conn.Conn())
 			conn.Release()
@@ -676,6 +674,7 @@ func (p *Pool) withRetries(ctx context.Context, fn func(conn *pgxpool.Conn) erro
 
 		return err
 	}
+	data.RetryLimitReached = true
 	// If we arrive here, the maximum retries threshold have been reached
 	return &MaxRetryError{
 		MaxRetries: maxRetries,

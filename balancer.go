@@ -2,14 +2,11 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -28,45 +25,6 @@ const (
 	// defaultBalancingTimeout is the default for balancing timeouts which bounds a single balancing operation.
 	defaultBalancingTimeout = 10 * time.Second
 )
-
-var (
-	newNodeConnectionBalancerMetricsOnce = sync.OnceValue(newNodeConnectionBalancerMetrics)
-)
-
-type balancerMetrics struct {
-	// acquiredConnectionsHistogram records idle connections inspected per run.
-	acquiredConnectionsHistogram metric.Int64Histogram
-
-	// prunedConnectionsHistogram records connections marked for pruning per run.
-	prunedConnectionsHistogram metric.Int64Histogram
-}
-
-func newNodeConnectionBalancerMetrics() *balancerMetrics {
-	acquireHist, err := meter.Int64Histogram(
-		"crdbpgx.balancer.acquired",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections acquired for pruning"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb balancer acquire histogram: %w", err))
-	}
-
-	pruneHist, err := meter.Int64Histogram(
-		"crdbpgx.balancer.pruned",
-		metric.WithUnit("{connection}"),
-		metric.WithDescription("connections pruned per balancing run"),
-		metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 5, 10, 15, 20, 30, 50),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb balancer prune histogram: %w", err))
-	}
-
-	return &balancerMetrics{
-		acquiredConnectionsHistogram: acquireHist,
-		prunedConnectionsHistogram:   pruneHist,
-	}
-}
 
 // NodeBalancer balances pooled connections across CockroachDB nodes.
 type NodeBalancer interface {
@@ -105,9 +63,6 @@ type nodeConnectionBalancer struct {
 	// logger emits optional debug logs.
 	logger *slog.Logger
 
-	// metrics contains shared balancer metric instruments.
-	metrics *balancerMetrics
-
 	// rebalance performs the balancing operation.
 	//
 	// IMPORTANT: sole purpose of this field is for testing.
@@ -132,7 +87,6 @@ func NewNodeConnectionBalancer(opts ...NodeConnectionBalancerOption) NodeBalance
 		balanceTimeout:                defaultBalancingTimeout,
 		logger:                        slog.Default(),
 		balancingInterval:             defaultBalancingInterval,
-		metrics:                       newNodeConnectionBalancerMetricsOnce(),
 		topologyChangeBalanceInterval: defaultTopologyChangeBalancingInterval,
 		topologyChangeBalanceWindow:   defaultTopologyChangeBalancingIntervalWindow,
 	}
@@ -213,24 +167,24 @@ func (p *nodeConnectionBalancer) Rebalance(ctx context.Context, pool *Pool) {
 }
 
 func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) {
+	data := RebalanceEndData{PoolName: pool.Name()}
+	defer func() {
+		pool.hooks.onRebalanceEnd(ctx, data)
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, p.balanceTimeout)
+	balanceCtx, cancel := context.WithTimeout(ctx, p.balanceTimeout)
 	defer cancel()
 
-	conns := pool.AcquireAllIdle(ctx)
+	conns := pool.AcquireAllIdle(balanceCtx)
 	defer func() {
 		// Release all acquired idle connections
 		for _, c := range conns {
 			c.Release()
 		}
 	}()
-	p.metrics.acquiredConnectionsHistogram.Record(ctx, int64(len(conns)),
-		metric.WithAttributes(
-			attribute.String("pool.id", pool.Name()),
-		),
-	)
+	data.Acquired = len(conns)
 
 	nodeCount := max(pool.health.NumHealthy(), 1)
 
@@ -252,8 +206,6 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 	maxConns := pool.MaxConns()
 	nodeMax := maxConnsPerNode(maxConns, nodeCount)
 
-	var prunedTotal int64
-
 	for nodeID, cnt := range connsPerNode {
 		// Prune only connections above the per-node maximum. When there is
 		// more than one excess connection, prune half of the excess so the
@@ -274,9 +226,9 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 			pool.GCMark(c.Conn())
 		}
 
-		prunedTotal += int64(toPrune)
+		data.Pruned += toPrune
 		p.logger.DebugContext(
-			ctx,
+			balanceCtx,
 			"balancer: pruned connections",
 			slog.String("library", "github.com/sumup/crdbpgx"),
 			slog.String("pool", pool.Name()),
@@ -287,12 +239,6 @@ func (p *nodeConnectionBalancer) rebalancePool(ctx context.Context, pool *Pool) 
 			slog.Int("node_pruned_conns", toPrune),
 		)
 	}
-
-	p.metrics.prunedConnectionsHistogram.Record(ctx, prunedTotal,
-		metric.WithAttributes(
-			attribute.String("pool.id", pool.Name()),
-		),
-	)
 }
 
 // maxConnsPerNode returns the maximum number of connections per node

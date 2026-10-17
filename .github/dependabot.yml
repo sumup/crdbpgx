@@ -10,7 +10,17 @@ updates:
     schedule:
       interval: "daily"
     open-pull-requests-limit: 5
+  - package-ecosystem: "gomod"
+    directory: "/crdbotel"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
     groups:
       otel:
         patterns: 
           - "go.opentelemetry.io/*"
+  - package-ecosystem: "gomod"
+    directory: "/crdbprom"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5

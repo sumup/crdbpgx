@@ -7,6 +7,8 @@ on:
       - main
     tags:
       - v[0-9]+.[0-9]+.[0-9]+*
+      - crdbotel/v[0-9]+.[0-9]+.[0-9]+*
+      - crdbprom/v[0-9]+.[0-9]+.[0-9]+*
   pull_request:
     branches:
       - main
@@ -27,12 +29,17 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
+          cache-dependency-path: "**/go.sum"
+
+      - name: Configure module workspace
+        run: make workspace
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: ./... ./crdbotel/... ./crdbprom/...
 
   test:
     name: Test
@@ -48,9 +55,18 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
+          cache-dependency-path: "**/go.sum"
 
       - name: Test
         run: make test
+
+      - name: Test standalone OpenTelemetry release
+        if: startsWith(github.ref, 'refs/tags/crdbotel/')
+        run: GOWORK=off go -C crdbotel test -race -timeout 1m ./...
+
+      - name: Test standalone Prometheus release
+        if: startsWith(github.ref, 'refs/tags/crdbprom/')
+        run: GOWORK=off go -C crdbprom test -race -timeout 1m ./...
 
   integration:
     name: Integration tests
@@ -77,7 +93,8 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
+          cache-dependency-path: "**/go.sum"
 
       - name: Integration tests
         run: make test-integration
@@ -96,7 +113,8 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 'stable'
+          go-version: "stable"
+          cache-dependency-path: "**/go.sum"
 
       - name: govulncheck scan
         run: |

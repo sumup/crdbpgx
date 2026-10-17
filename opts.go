@@ -39,6 +39,8 @@ type poolCfg struct {
 
 	// balancer overrides the default node connection balancer.
 	balancer NodeBalancer
+
+	hooks hooks
 }
 
 func defaultPoolCfg() *poolCfg {
@@ -52,6 +54,22 @@ func defaultPoolCfg() *poolCfg {
 
 // Option is a configuration option for a [Pool].
 type Option func(*poolCfg)
+
+// WithHooks configures optional instrumentation for the pool, its built-in
+// balancer, and its automatically created health tracker. Hooks are appended in
+// registration order, including across multiple WithHooks calls. Nil entries are
+// ignored. A custom health tracker keeps its own instrumentation; configure a
+// shared built-in tracker with [WithHealthTrackerHooks].
+// Query callbacks run in registration order, followed by any existing pgx tracer.
+func WithHooks(hooks ...Hook) Option {
+	return func(pc *poolCfg) {
+		for _, hook := range hooks {
+			if hook != nil {
+				pc.hooks = append(pc.hooks, hook)
+			}
+		}
+	}
+}
 
 // WithName configures the pool name used for observability (metrics and tracing).
 // The default if not specified is "crdbpgx".
@@ -87,7 +105,7 @@ func WithContextPropagationBehaviour(behavior ContextPropagationBehaviour) Optio
 }
 
 // WithLogger configures the logger for the [Pool].
-// By default, no logger is configured and debug logging is disabled.
+// A nil logger uses [slog.Default], which is also the default.
 func WithLogger(l *slog.Logger) Option {
 	return func(pc *poolCfg) {
 		pc.logger = l

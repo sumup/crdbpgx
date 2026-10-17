@@ -39,10 +39,9 @@ const (
 	// still respecting cancellation during connection acquisition.
 	ContextPropagationOnAcquire
 
-	// ContextPropagationDetach detaches the caller's context completely, creating
-	// a new background context for both connection acquisition and database operations.
-	// Tracing information is preserved. This provides maximum isolation from context
-	// cancellation but operations cannot be canceled by the caller.
+	// ContextPropagationDetach removes caller cancellation and deadlines from
+	// both connection acquisition and database operations. Context values,
+	// including tracing information, are preserved.
 	ContextPropagationDetach
 )
 
