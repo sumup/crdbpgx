@@ -18,7 +18,11 @@ lint-fix: ## Lint go files and apply auto-fixes
 
 .PHONY: test
 test: ## Run tests
-	go test -v -failfast -race -timeout 10m ./...
+	go test -v -race -timeout 1m ./...
+
+.PHONY: test-integration
+test-integration: ## Run integration tests against CRDB_TEST_DATABASE_URL
+	go test -tags=integration -run '^TestIntegration' -v -race -count=1 -timeout 2m ./...
 
 .PHONY: download
 download:

@@ -2,7 +2,11 @@ package crdbpgx_test
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sumup/crdbpgx"
 )
@@ -10,34 +14,49 @@ import (
 func TestJitteredTicker(t *testing.T) {
 	t.Parallel()
 
-	dur := 100 * time.Millisecond
-	jit := 200 * time.Millisecond
-	tk := crdbpgx.NewJitteredTicker(dur, &mockJitter{nextJitter: jit})
+	synctest.Test(t, func(t *testing.T) {
+		const interval = 300 * time.Millisecond
+		ticker := crdbpgx.NewJitteredTicker(100*time.Millisecond, &mockJitter{nextJitter: 200 * time.Millisecond})
+		t.Cleanup(ticker.Stop)
 
-	select {
-	case <-tk.C:
-		t.Fatal("unexpected tick before jitter")
-	case <-time.After(jit):
-		// We must not return before the first tick with jitter applied.
-	}
+		ticks := make(chan time.Time, 2)
+		go func() {
+			for tick := range ticker.C {
+				ticks <- tick
+			}
+		}()
+		synctest.Wait()
 
-	select {
-	case <-tk.C:
-		// We must return after the first tick with jitter applied.
-		tk.Stop()
-	case <-time.After(2 * (dur + jit)):
-		t.Fatal("expected tick after jitter expired")
-	}
+		start := time.Now()
+		time.Sleep(interval - time.Nanosecond)
+		synctest.Wait()
+		assert.Empty(t, ticks, "must not tick before the jittered interval")
 
-	// Check close
-	select {
-	case tt := <-tk.C:
-		if !tt.IsZero() {
-			t.Fatal("closed ticker must return the zero time")
-		}
-	case <-time.After(2 * (dur + jit)):
-		t.Fatal("closed ticker must return immediately")
-	}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		require.Len(t, ticks, 1)
+		assert.Equal(t, start.Add(interval), <-ticks)
+
+		time.Sleep(interval)
+		synctest.Wait()
+		require.Len(t, ticks, 1)
+		assert.Equal(t, start.Add(2*interval), <-ticks)
+	})
+}
+
+func TestJitteredTicker_Stop(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		ticker := crdbpgx.NewJitteredTicker(time.Hour, &mockJitter{})
+		synctest.Wait()
+		ticker.Stop()
+		synctest.Wait()
+
+		tick, ok := <-ticker.C
+		assert.False(t, ok, "Stop must close the tick channel")
+		assert.True(t, tick.IsZero())
+	})
 }
 
 type mockJitter struct {

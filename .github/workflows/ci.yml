@@ -30,7 +30,7 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: golangci-lint
-        uses: reviewdog/action-actionlint@6a9ff88b9bb9c12ff3d7340e267f0f59effaa7cd # v1.80.1
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
 
@@ -50,7 +50,39 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Test
-        run: go test -v -failfast -race -timeout 10m ./...
+        run: make test
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    services:
+      cockroach:
+        image: cockroachdb/cockroach:v25.1.4
+        env:
+          COCKROACH_ARGS: >-
+            start-single-node --insecure
+            --store=type=mem,size=1GiB
+            --cache=64MiB --max-sql-memory=64MiB
+            --listen-addr=:26257
+        ports:
+          - 26257:26257
+        options: >-
+          --health-cmd="/cockroach/cockroach sql --insecure --host=localhost:26257 --execute='SELECT 1'"
+          --health-interval=2s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Integration tests
+        run: make test-integration
+        env:
+          CRDB_TEST_DATABASE_URL: postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable
 
   vulncheck:
     name: Vulncheck

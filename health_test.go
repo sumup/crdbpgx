@@ -3,6 +3,7 @@ package crdbpgx_test
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,7 +53,7 @@ func TestNodeHealthTracker(t *testing.T) {
 		require.NoError(t, err)
 
 		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
-		defer unsubscribe()
+		t.Cleanup(unsubscribe)
 
 		tracker.SetStatus(1, true)
 		requireNoTopologyChange(t, topologyChanges)
@@ -75,7 +76,7 @@ func TestNodeHealthTracker(t *testing.T) {
 		require.NoError(t, err)
 
 		topologyChanges, unsubscribe := tracker.SubscribeTopologyChanges()
-		defer unsubscribe()
+		t.Cleanup(unsubscribe)
 
 		tracker.SetStatus(1, true)
 		requireNoTopologyChange(t, topologyChanges)
@@ -106,27 +107,67 @@ func TestNodeHealthTracker(t *testing.T) {
 		requireNoTopologyChange(t, topologyChanges)
 	})
 
-	t.Run("poll context cancelation", func(t *testing.T) {
-		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{}, crdbpgx.WithPollInterval(time.Hour))
-		require.NoError(t, err)
+	t.Run("poll context cancellation", func(t *testing.T) {
+		t.Parallel()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			tracker.Poll(ctx)
-		}()
+		synctest.Test(t, func(t *testing.T) {
+			tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{}, crdbpgx.WithPollInterval(time.Hour))
+			require.NoError(t, err)
 
-		cancel()
-
-		require.Eventually(t, func() bool {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				tracker.Poll(ctx)
+			}()
+			synctest.Wait()
+			cancel()
+			synctest.Wait()
 			select {
 			case <-done:
-				return true
 			default:
-				return false
+				t.Fatal("Poll did not stop after cancellation")
 			}
-		}, time.Second, 10*time.Millisecond)
+		})
+	})
+
+	t.Run("refills the failure allowance", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+			require.NoError(t, err)
+			tracker.SetStatus(1, true)
+			tracker.SetStatus(1, false)
+			tracker.SetStatus(1, false)
+			require.True(t, tracker.IsHealthy(1))
+
+			time.Sleep(time.Minute)
+			tracker.SetStatus(1, false)
+			require.True(t, tracker.IsHealthy(1), "one failure is allowed after refill")
+			tracker.SetStatus(1, false)
+			require.False(t, tracker.IsHealthy(1))
+		})
+	})
+
+	t.Run("recovery resets the failure allowance", func(t *testing.T) {
+		t.Parallel()
+
+		tracker, err := crdbpgx.NewNodeHealthTracker(&pgx.ConnConfig{})
+		require.NoError(t, err)
+		tracker.SetStatus(1, true)
+		for range 3 {
+			tracker.SetStatus(1, false)
+		}
+		require.False(t, tracker.IsHealthy(1))
+
+		tracker.SetStatus(1, true)
+		tracker.SetStatus(1, false)
+		tracker.SetStatus(1, false)
+		require.True(t, tracker.IsHealthy(1))
+		tracker.SetStatus(1, false)
+		require.False(t, tracker.IsHealthy(1))
 	})
 }
 
@@ -135,7 +176,7 @@ func requireTopologyChange(t *testing.T, topologyChanges <-chan struct{}) {
 
 	select {
 	case <-topologyChanges:
-	case <-time.After(time.Second):
+	default:
 		t.Fatal("expected topology change")
 	}
 }
@@ -146,6 +187,6 @@ func requireNoTopologyChange(t *testing.T, topologyChanges <-chan struct{}) {
 	select {
 	case <-topologyChanges:
 		t.Fatal("unexpected topology change")
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 }

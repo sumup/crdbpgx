@@ -2,123 +2,89 @@ package crdbpgx
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNodeConnectionBalancer_AcceleratesOnTopologyChange(t *testing.T) {
+func TestNodeConnectionBalancer_Run(t *testing.T) {
 	t.Parallel()
 
-	t.Run("topology changes", func(t *testing.T) {
+	testTopologyChange := func(t *testing.T, change func(*nodeHealthTracker)) {
+		t.Helper()
+
+		synctest.Test(t, func(t *testing.T) {
+			tracker, err := NewNodeHealthTracker(&pgx.ConnConfig{})
+			require.NoError(t, err)
+			tracker.SetStatus(1, true)
+
+			balancer := NewNodeConnectionBalancer(
+				WithBalancingInterval(time.Hour),
+				WithTopologyChangeBalancingInterval(time.Minute, 3*time.Minute),
+			).(*nodeConnectionBalancer)
+			var rebalances atomic.Int64
+			balancer.rebalance = func(context.Context, *Pool) { rebalances.Add(1) }
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				balancer.Run(ctx, &Pool{health: tracker})
+			}()
+			synctest.Wait()
+			assert.Zero(t, rebalances.Load())
+
+			change(tracker)
+			synctest.Wait()
+			assert.Equal(t, int64(1), rebalances.Load(), "topology change triggers an immediate rebalance")
+
+			time.Sleep(time.Minute)
+			synctest.Wait()
+			assert.Equal(t, int64(2), rebalances.Load(), "rebalance uses the accelerated interval")
+
+			time.Sleep(2 * time.Minute)
+			synctest.Wait()
+			assert.Equal(t, int64(4), rebalances.Load())
+
+			time.Sleep(time.Hour - time.Nanosecond)
+			synctest.Wait()
+			assert.Equal(t, int64(4), rebalances.Load(), "accelerated balancing stops when the window expires")
+
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			assert.Equal(t, int64(5), rebalances.Load(), "regular balancing resumes")
+
+			cancel()
+			synctest.Wait()
+			select {
+			case <-done:
+			default:
+				t.Fatal("balancer did not stop after cancellation")
+			}
+		})
+	}
+
+	t.Run("node left", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("node left", func(t *testing.T) {
-			t.Parallel()
-
-			tracker, err := NewNodeHealthTracker(&pgx.ConnConfig{})
-			require.NoError(t, err)
-
-			balancer := NewNodeConnectionBalancer(
-				WithBalancingInterval(time.Hour),
-				WithTopologyChangeBalancingInterval(10*time.Millisecond, 75*time.Millisecond),
-			).(*nodeConnectionBalancer)
-
-			rebalanced := make(chan struct{}, 10)
-			balancer.rebalance = func(context.Context, *Pool) {
-				select {
-				case rebalanced <- struct{}{}:
-				default:
-				}
+		testTopologyChange(t, func(tracker *nodeHealthTracker) {
+			for range 3 {
+				tracker.SetStatus(1, false)
 			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				balancer.Run(ctx, &Pool{health: tracker})
-			}()
-
-			select {
-			case <-rebalanced:
-				t.Fatal("unexpected rebalance before topology change")
-			case <-time.After(25 * time.Millisecond):
-			}
-
-			tracker.SetStatus(1, true)
-			tracker.SetStatus(1, false)
-			tracker.SetStatus(1, false)
-			tracker.SetStatus(1, false)
-
-			require.Eventually(t, func() bool {
-				return len(rebalanced) >= 3
-			}, time.Second, 10*time.Millisecond)
-
-			cancel()
-			require.Eventually(t, func() bool {
-				select {
-				case <-done:
-					return true
-				default:
-					return false
-				}
-			}, time.Second, 10*time.Millisecond)
 		})
+	})
 
-		t.Run("node joined", func(t *testing.T) {
-			t.Parallel()
+	t.Run("node joined", func(t *testing.T) {
+		t.Parallel()
 
-			tracker, err := NewNodeHealthTracker(&pgx.ConnConfig{})
-			require.NoError(t, err)
-
-			balancer := NewNodeConnectionBalancer(
-				WithBalancingInterval(time.Hour),
-				WithTopologyChangeBalancingInterval(10*time.Millisecond, 75*time.Millisecond),
-			).(*nodeConnectionBalancer)
-
-			rebalanced := make(chan struct{}, 10)
-			balancer.rebalance = func(context.Context, *Pool) {
-				select {
-				case rebalanced <- struct{}{}:
-				default:
-				}
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				balancer.Run(ctx, &Pool{health: tracker})
-			}()
-
-			tracker.SetStatus(1, true)
-			select {
-			case <-rebalanced:
-				t.Fatal("unexpected rebalance before topology change")
-			case <-time.After(25 * time.Millisecond):
-			}
-
+		testTopologyChange(t, func(tracker *nodeHealthTracker) {
 			tracker.SetStatus(2, true)
-
-			require.Eventually(t, func() bool {
-				return len(rebalanced) >= 3
-			}, time.Second, 10*time.Millisecond)
-
-			cancel()
-			require.Eventually(t, func() bool {
-				select {
-				case <-done:
-					return true
-				default:
-					return false
-				}
-			}, time.Second, 10*time.Millisecond)
 		})
 	})
 }
