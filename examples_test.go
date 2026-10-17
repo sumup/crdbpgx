@@ -2,7 +2,6 @@ package crdbpgx_test
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"time"
@@ -38,7 +37,7 @@ func ExampleNewPool() {
 
 func ExamplePool_InTx() {
 	transferFunds := func(ctx context.Context, pool *crdbpgx.Pool, accountID string, amount int64) error {
-		return pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db crdbpgx.Tx) error {
+		return pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db crdbpgx.Runner) error {
 			return db.ExecFunc(
 				ctx,
 				func(_ context.Context, _ pgconn.CommandTag, err error) error {
@@ -54,48 +53,23 @@ func ExamplePool_InTx() {
 	_ = transferFunds
 }
 
-func ExamplePool_InTx_queryAndUpdate() {
+// The same helper accepts a pool or a transaction through Runner.
+func ExampleQueries_Query() {
+	listIDs := func(ctx context.Context, db crdbpgx.Queries) ([]int64, error) {
+		return db.Query(ctx, pgx.RowTo[int64],
+			"SELECT id FROM users WHERE active = @active", pgx.NamedArgs{"active": true})
+	}
+	_ = listIDs
+}
+
+func ExampleQueries_QueryRow() {
 	type User struct {
-		ID        string    `db:"id"`
-		Name      string    `db:"name"`
-		Email     string    `db:"email"`
-		UpdatedAt time.Time `db:"updated_at"`
+		ID   int64  `db:"id"`
+		Name string `db:"name"`
 	}
-
-	updateUser := func(ctx context.Context, pool *crdbpgx.Pool, userID, name, email string) error {
-		return pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, tx crdbpgx.Tx) error {
-			user, err := tx.QueryRowFunc(
-				ctx,
-				pgx.RowToStructByName[User],
-				`SELECT id, name, email, updated_at FROM users WHERE id = $1 FOR UPDATE`,
-				userID,
-			)
-			if err != nil {
-				return fmt.Errorf("query user: %w", err)
-			}
-
-			user.Name = name
-			user.Email = email
-			user.UpdatedAt = time.Now()
-
-			tag, err := tx.Exec(
-				ctx,
-				`UPDATE users SET name = $2, email = $3, updated_at = $4 WHERE id = $1`,
-				user.ID,
-				user.Name,
-				user.Email,
-				user.UpdatedAt,
-			)
-			if err != nil {
-				return fmt.Errorf("update user: %w", err)
-			}
-			if tag.RowsAffected() != 1 {
-				return fmt.Errorf("update user: expected one affected row, got %d", tag.RowsAffected())
-			}
-
-			return nil
-		})
+	getUser := func(ctx context.Context, db crdbpgx.Queries, id int64) (User, error) {
+		return db.QueryRow(ctx, pgx.RowToStructByName[User],
+			"SELECT id, name FROM users WHERE id = $1", id)
 	}
-
-	_ = updateUser
+	_ = getUser
 }

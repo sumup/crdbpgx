@@ -59,6 +59,34 @@ func main() {
 }
 ```
 
+## Typed queries
+
+`Queries` provides generic `Query` and `QueryRow` methods on Go 1.27+. Wrap a
+pool or transaction with `NewQueries` to share the same query code. The embedded
+`Runner` retains the callback API and transaction behavior:
+
+```go
+// db := crdbpgx.NewQueries(pool)
+// Inside a transaction: db := crdbpgx.NewQueries(tx)
+
+func listIDs(ctx context.Context, db crdbpgx.Queries) ([]int64, error) {
+  return db.Query(ctx, pgx.RowTo[int64], "SELECT id FROM users")
+}
+
+func getID(ctx context.Context, db crdbpgx.Queries, name string) (int64, error) {
+  return db.QueryRow(ctx, pgx.RowTo[int64],
+    "SELECT id FROM users WHERE name = $1", name)
+}
+```
+
+Both helpers close their rows. `QueryRow` returns the first row, ignores additional
+rows, and returns `pgx.ErrNoRows` for an empty result. On error, `Query` returns
+nil and `QueryRow` returns the zero value of the result type.
+
+Pool operations retry the query and collection together. Inside a transaction,
+errors propagate to the outer transaction retry loop. Row collectors can run
+again during retries and should avoid external side effects.
+
 ## Components
 
 There are three main components of `crdbpgx`:
@@ -147,3 +175,37 @@ Pool hooks also implement pgx's `TraceQueryStart` and `TraceQueryEnd`. These cal
 
 - [Johannes Gräger](mailto:johannes.graeger@sumup.com)
 - [Matouš Dzivjak](mailto:matous.dzivjak@sumup.com)
+
+## Integration Testing
+
+There is an opt-in Docker-backed integration test that starts a 3-node CockroachDB cluster, stops one node, restarts it, and asserts that `crdbpgx` recovers and re-discovers the node.
+
+Requirements:
+
+- Docker with the local daemon running
+- free host ports `26257-26259` and `8080-8082`
+
+Run it with:
+
+```sh
+make test-integration
+```
+
+The cluster definition lives in [`testdata/crdb-cluster/docker-compose.yml`](./testdata/crdb-cluster/docker-compose.yml). By default it uses `cockroachdb/cockroach:v26.2.0`, but you can override that for local experiments:
+
+```sh
+CRDB_IMAGE=cockroachdb/cockroach:v25.1.10 make test-integration
+```
+
+### Typed query integration tests
+
+To test typed queries, retries, and nested transactions against an existing
+CockroachDB test database, set `CRDBPGX_TEST_DATABASE_URL`:
+
+```sh
+CRDBPGX_TEST_DATABASE_URL='postgres://root@localhost:26257/defaultdb?sslmode=disable' \
+  go test -race -run TestQueryIntegration -v ./...
+```
+
+The test creates and removes its own table. Without this variable, the database
+integration test is skipped; typed query unit tests still run.
