@@ -59,6 +59,55 @@ func main() {
 }
 ```
 
+## Typed queries and transactions
+
+`Pool` embeds a concrete `Runner`, so typed queries and commands are available
+as `pool.Query`, `pool.QueryRow`, and `pool.Exec` on Go 1.27+:
+
+```go
+users, err := pool.Query(ctx, pgx.RowToStructByName[User], "SELECT id, name FROM users")
+
+err = pool.InTx(ctx, pgx.TxOptions{}, func(tx crdbpgx.Runner) error {
+  user, err := tx.QueryRow(ctx, pgx.RowToStructByName[User],
+    "SELECT id, name FROM users WHERE id = $1", userID)
+  if err != nil {
+    return err
+  }
+  _, err = tx.Exec(ctx, "UPDATE users SET name = $1 WHERE id = $2", name, user.ID)
+  return err
+})
+```
+
+Store `pool.Runner` in repository code to use the same concrete type inside and
+outside transactions:
+
+```go
+type Repository struct {
+  db crdbpgx.Runner
+}
+
+repo := Repository{db: pool.Runner}
+```
+
+`Runner.InTx` supplies a transaction-bound `Runner` automatically. Calling it on
+that runner creates a savepoint. Only the outer pool retries the entire
+transaction. Callbacks can execute again during retries and should avoid
+external side effects. Do not retain a transaction runner after its callback.
+
+Both query methods close their rows. `QueryRow` returns the first row, ignores
+additional rows, and returns `pgx.ErrNoRows` for an empty result. On error,
+`Query` returns nil, `QueryRow` returns the zero value, and `Exec` returns an
+empty command tag. Typed transaction operations honor the pool's configured
+context propagation behavior.
+
+`Executor` is the underlying callback interface for adapters and test doubles.
+`NewRunner(executor)` wraps these implementations. Existing callback methods
+remain available. `InTxFunc` still supplies a `Tx` for callers that need the raw
+`pgx.Tx` methods.
+
+This is a breaking API change: the former `Runner` interface is now `Executor`,
+`Runner` is concrete, and `InTx` callbacks receive `func(Runner) error`.
+
 ## Components
 
 There are three main components of `crdbpgx`:

@@ -42,6 +42,9 @@ vulncheck: workspace ## Check for Vulnerabilities (make sure you have the tools 
 .PHONY: vulncheck-sarif
 vulncheck-sarif: workspace ## Check for Vulnerabilities
 	govulncheck -format=sarif ./... ./crdbotel/... ./crdbprom/... > govulncheck.sarif
+	# Remove duplicate CVE tags and stacks emitted by govulncheck (golang/go#75890).
+	jq '(.runs[]?.tool.driver.rules[]?.properties.tags | select(type == "array")) |= unique | (.runs[]?.results[]?.stacks | select(type == "array")) |= unique' govulncheck.sarif > govulncheck.sarif.tmp
+	mv govulncheck.sarif.tmp govulncheck.sarif
 
 .PHONY: generate
 generate: # Generate latest SDK

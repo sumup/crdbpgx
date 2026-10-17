@@ -24,6 +24,9 @@ import (
 // specifically designed for CockroachDB clusters, including automatic handling of
 // retryable and resettable errors, and optional connection management across nodes.
 type Pool struct {
+	// Runner provides typed queries and transactions backed by this pool.
+	Runner
+
 	// pool is the wrapped pgx connection pool.
 	pool *pgxpool.Pool
 
@@ -68,7 +71,7 @@ type Pool struct {
 }
 
 var (
-	_ Runner = (*Pool)(nil)
+	_ Executor = (*Pool)(nil)
 )
 
 // NewPool creates a new CockroachDB-aware connection pool.
@@ -140,6 +143,8 @@ func NewPool(
 		hooks:          cfg.hooks,
 		connectLimiter: rate.NewLimiter(rate.Every(cfg.connectRate), 1),
 	}
+
+	p.Runner = NewRunner(p)
 
 	afterConnect := pgxConfig.AfterConnect
 	pgxConfig.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
@@ -288,22 +293,15 @@ func (p *Pool) Ping(ctx context.Context) error {
 	return p.pool.Ping(p.contextForDBOp(ctx))
 }
 
-// Runner is the shared query execution interface implemented by both [Pool] and [Tx].
+// Executor is the callback execution interface implemented by both [Pool] and [Tx].
 //
-// This is the main abstraction for application code that should work both inside
-// and outside of a transaction without relying on context-carried transaction state.
-type Runner interface {
-	// ExecFunc executes SQL and passes its command tag and error to tagFunc.
-	// The callback's error determines whether the operation succeeds or is retried.
+// Use Runner for typed queries and transaction callbacks. Executor is the
+// underlying execution seam for adapters and test implementations.
+type Executor interface {
 	ExecFunc(ctx context.Context, tagFunc func(context.Context, pgconn.CommandTag, error) error, sql string, arguments ...any) error
-	// QueryFunc executes SQL and passes its rows to rowsFunc. It closes the rows
-	// when the callback returns. Query errors are returned without calling rowsFunc.
 	QueryFunc(ctx context.Context, rowsFunc func(context.Context, pgx.Rows) error, sql string, optionsAndArgs ...any) error
-	// QueryRowFunc executes SQL and passes a row to rowFunc. The callback must
-	// call Scan to consume the result and release the connection's query resources.
 	QueryRowFunc(ctx context.Context, rowFunc func(context.Context, pgx.Row) error, sql string, optionsAndArgs ...any) error
-	// InTxFunc runs a callback in a transaction, committing on success and rolling
-	// back on error. Nested calls use savepoints and ignore [pgx.TxOptions].
+	// InTxFunc ignores [pgx.TxOptions] when invoked as a nested (pseudo) transaction.
 	InTxFunc(context.Context, pgx.TxOptions, func(Tx) error) error
 }
 
@@ -313,71 +311,45 @@ type Runner interface {
 // on [Pool] such that users can use the same set of functions both outside and inside
 // a transaction (ExecFunc, QueryFunc, QueryRowFunc, InTxFunc).
 type Tx interface {
-	// Tx provides pgx's transaction operations.
 	pgx.Tx
-	// Runner provides the callback-based query and transaction methods.
-	Runner
+	Executor
 }
 
-// InTx executes a function within a transaction and passes a [Runner] that should
-// be used for all operations in the transactional unit.
-//
-// The transaction is automatically committed if txFunc returns nil, or rolled back
-// if txFunc returns an error. In case of retryable errors, the entire transaction
-// callback is re-executed.
-//
-// The callback receives the context that should be used for transaction-bound
-// database operations.
-func (p *Pool) InTx(ctx context.Context, txOptions pgx.TxOptions, txFunc func(context.Context, Runner) error) error {
+// InTxFunc executes a callback with the underlying transaction.
+// It retries the entire callback on retryable errors and resets connections on
+// resettable errors. Use Runner.InTx for a callback with typed query methods.
+func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc func(Tx) error) error {
 	return p.withRetries(ctx, func(conn *pgxpool.Conn) error {
-		ctx = p.contextForDBOp(ctx)
-		tx, err := conn.BeginTx(ctx, txOptions)
+		dbCtx := p.contextForDBOp(ctx)
+		tx, err := conn.BeginTx(dbCtx, txOptions)
 		if err != nil {
 			return err
 		}
-		return beginFuncExec(ctx, crdbTx{tx}, func(tx Tx) error {
-			return txFunc(ctx, tx)
-		})
+		return beginFuncExec(dbCtx, crdbTx{Tx: tx, dbContext: p.contextForDBOp}, txFunc)
 	})
 }
 
-// InTxFunc executes a function within a transaction with automatic retry logic.
-//
-// This is a replacement for pgxpool.BeginTxFunc that provides CockroachDB-specific
-// error handling. It resets the connection on resettable errors (e.g., node failures)
-// and retries the transaction on retryable errors (e.g., serialization failures).
-//
-// The transaction is automatically committed if txFunc returns nil, or rolled back
-// if txFunc returns an error. In case of retryable errors, the entire transaction
-// (including txFunc) is re-executed.
-func (p *Pool) InTxFunc(ctx context.Context, txOptions pgx.TxOptions, txFunc func(Tx) error) error {
-	return p.InTx(ctx, txOptions, func(_ context.Context, runner Runner) error {
-		tx, ok := runner.(Tx)
-		if !ok {
-			return fmt.Errorf("runner does not implement Tx")
-		}
-		return txFunc(tx)
-	})
-}
-
-// InTxFunc runs fn in a nested transaction using a savepoint.
 func (t crdbTx) InTxFunc(
 	ctx context.Context,
 	_ pgx.TxOptions,
 	fn func(Tx) error,
 ) error {
+	ctx = t.dbContext(ctx)
 	nested, err := t.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin savepoint: %w", err)
 	}
-	return beginFuncExec(ctx, crdbTx{nested}, fn)
+	return beginFuncExec(ctx, crdbTx{Tx: nested, dbContext: t.dbContext}, fn)
 }
 
-type crdbTx struct{ pgx.Tx }
+type crdbTx struct {
+	pgx.Tx
+	dbContext func(context.Context) context.Context
+}
 
 var (
-	_ Runner = crdbTx{}
-	_ Tx     = crdbTx{}
+	_ Executor = crdbTx{}
+	_ Tx       = crdbTx{}
 )
 
 // Close closes all connections in the pool and prevents new connections from being acquired.
@@ -423,6 +395,7 @@ func (p *Pool) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, t
 
 // ExecFunc executes a SQL command within the transaction and calls tagFunc with the result.
 func (t crdbTx) ExecFunc(ctx context.Context, tagFunc func(ctx context.Context, tag pgconn.CommandTag, err error) error, sql string, arguments ...any) error {
+	ctx = t.dbContext(ctx)
 	tag, err := t.Exec(ctx, sql, arguments...)
 	return tagFunc(ctx, tag, err)
 }
@@ -444,6 +417,7 @@ func (p *Pool) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context,
 
 // QueryFunc executes a SQL query within the transaction and calls rowsFunc with the resulting rows.
 func (t crdbTx) QueryFunc(ctx context.Context, rowsFunc func(ctx context.Context, rows pgx.Rows) error, sql string, optionsAndArgs ...any) error {
+	ctx = t.dbContext(ctx)
 	rows, err := t.Query(ctx, sql, optionsAndArgs...)
 	if err != nil {
 		return err
@@ -464,6 +438,7 @@ func (p *Pool) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Contex
 // QueryRowFunc executes a SQL query that returns at most one row within the transaction
 // and calls rowFunc with the result.
 func (t crdbTx) QueryRowFunc(ctx context.Context, rowFunc func(ctx context.Context, row pgx.Row) error, sql string, optionsAndArgs ...any) error {
+	ctx = t.dbContext(ctx)
 	row := t.QueryRow(ctx, sql, optionsAndArgs...)
 	return rowFunc(ctx, row)
 }
