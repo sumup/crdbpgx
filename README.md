@@ -59,33 +59,54 @@ func main() {
 }
 ```
 
-## Typed queries
+## Typed queries and transactions
 
-`Queries` provides generic `Query` and `QueryRow` methods on Go 1.27+. Wrap a
-pool or transaction with `NewQueries` to share the same query code. The embedded
-`Runner` retains the callback API and transaction behavior:
+`Pool` embeds a concrete `Runner`, so typed queries and commands are available
+as `pool.Query`, `pool.QueryRow`, and `pool.Exec` on Go 1.27+:
 
 ```go
-// db := crdbpgx.NewQueries(pool)
-// Inside a transaction: db := crdbpgx.NewQueries(tx)
+users, err := pool.Query(ctx, pgx.RowToStructByName[User], "SELECT id, name FROM users")
 
-func listIDs(ctx context.Context, db crdbpgx.Queries) ([]int64, error) {
-  return db.Query(ctx, pgx.RowTo[int64], "SELECT id FROM users")
-}
-
-func getID(ctx context.Context, db crdbpgx.Queries, name string) (int64, error) {
-  return db.QueryRow(ctx, pgx.RowTo[int64],
-    "SELECT id FROM users WHERE name = $1", name)
-}
+err = pool.InTx(ctx, pgx.TxOptions{}, func(tx crdbpgx.Runner) error {
+  user, err := tx.QueryRow(ctx, pgx.RowToStructByName[User],
+    "SELECT id, name FROM users WHERE id = $1", userID)
+  if err != nil {
+    return err
+  }
+  _, err = tx.Exec(ctx, "UPDATE users SET name = $1 WHERE id = $2", name, user.ID)
+  return err
+})
 ```
 
-Both helpers close their rows. `QueryRow` returns the first row, ignores additional
-rows, and returns `pgx.ErrNoRows` for an empty result. On error, `Query` returns
-nil and `QueryRow` returns the zero value of the result type.
+Store `pool.Runner` in repository code to use the same concrete type inside and
+outside transactions:
 
-Pool operations retry the query and collection together. Inside a transaction,
-errors propagate to the outer transaction retry loop. Row collectors can run
-again during retries and should avoid external side effects.
+```go
+type Repository struct {
+  db crdbpgx.Runner
+}
+
+repo := Repository{db: pool.Runner}
+```
+
+`Runner.InTx` supplies a transaction-bound `Runner` automatically. Calling it on
+that runner creates a savepoint. Only the outer pool retries the entire
+transaction. Callbacks can execute again during retries and should avoid
+external side effects. Do not retain a transaction runner after its callback.
+
+Both query methods close their rows. `QueryRow` returns the first row, ignores
+additional rows, and returns `pgx.ErrNoRows` for an empty result. On error,
+`Query` returns nil, `QueryRow` returns the zero value, and `Exec` returns an
+empty command tag. Typed transaction operations honor the pool's configured
+context propagation behavior.
+
+`Executor` is the underlying callback interface for adapters and test doubles.
+`NewRunner(executor)` wraps these implementations. Existing callback methods
+remain available. `InTxFunc` still supplies a `Tx` for callers that need the raw
+`pgx.Tx` methods.
+
+This is a breaking API change: the former `Runner` interface is now `Executor`,
+`Runner` is concrete, and `InTx` callbacks receive `func(Runner) error`.
 
 ## Components
 
@@ -196,16 +217,3 @@ The cluster definition lives in [`testdata/crdb-cluster/docker-compose.yml`](./t
 ```sh
 CRDB_IMAGE=cockroachdb/cockroach:v25.1.10 make test-integration
 ```
-
-### Typed query integration tests
-
-To test typed queries, retries, and nested transactions against an existing
-CockroachDB test database, set `CRDBPGX_TEST_DATABASE_URL`:
-
-```sh
-CRDBPGX_TEST_DATABASE_URL='postgres://root@localhost:26257/defaultdb?sslmode=disable' \
-  go test -race -run TestQueryIntegration -v ./...
-```
-
-The test creates and removes its own table. Without this variable, the database
-integration test is skipped; typed query unit tests still run.

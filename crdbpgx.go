@@ -63,7 +63,7 @@
 //
 // # Example: run a transaction with automatic retries
 //
-//	err := pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db crdbpgx.Runner) error {
+//	err := pool.InTx(ctx, pgx.TxOptions{}, func(db crdbpgx.Runner) error {
 //		return db.ExecFunc(ctx, func(_ context.Context, _ pgconn.CommandTag, err error) error {
 //			return err
 //		}, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, accountID)

@@ -72,7 +72,7 @@ func TestIntegrationPool_InTx(t *testing.T) {
 				ctx = WithDisableRetries(ctx)
 			}
 			var attempts int
-			err := pool.InTx(ctx, pgx.TxOptions{}, func(ctx context.Context, db Runner) error {
+			err := pool.InTx(ctx, pgx.TxOptions{}, func(db Runner) error {
 				attempts++
 				if err := db.ExecFunc(ctx, func(_ context.Context, _ pgconn.CommandTag, err error) error {
 					return err
