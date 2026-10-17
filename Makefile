@@ -4,38 +4,44 @@
 help: ## Show help
 	@grep -Eh '^[0-9a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
+.PHONY: workspace
+workspace: ## Configure the local workspace for all modules
+	@test -f go.work || go work init . ./crdbotel ./crdbprom
+	@go work use . ./crdbotel ./crdbprom
+	@go work edit -replace=github.com/sumup/crdbpgx@v1.1.0=.
+
 .PHONY: fmt
-fmt: ## Format go files
-	golangci-lint fmt --verbose
+fmt: workspace ## Format go files in all modules
+	golangci-lint fmt --verbose ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: lint
-lint: ## Lint go files
-	golangci-lint run --verbose
+lint: workspace ## Lint go files in all modules
+	golangci-lint run --verbose ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: lint-fix
-lint-fix: ## Lint go files and apply auto-fixes
-	golangci-lint run --verbose --fix
+lint-fix: workspace ## Lint go files and apply auto-fixes
+	golangci-lint run --verbose --fix ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: test
-test: ## Run tests
-	go test -v -race -timeout 1m ./...
+test: workspace ## Run tests in all modules
+	go test -v -race -timeout 1m ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: test-integration
 test-integration: ## Run integration tests against CRDB_TEST_DATABASE_URL
 	go test -tags=integration -run '^TestIntegration' -v -race -count=1 -timeout 2m ./...
 
 .PHONY: download
-download:
+download: workspace
 	@echo Download go.mod dependencies
 	@go mod download
 
 .PHONY: vulncheck
-vulncheck: ## Check for Vulnerabilities (make sure you have the tools install: `make install-tools`)
-	govulncheck ./...
+vulncheck: workspace ## Check for Vulnerabilities (make sure you have the tools install: `make install-tools`)
+	govulncheck ./... ./crdbotel/... ./crdbprom/...
 
 .PHONY: vulncheck-sarif
-vulncheck-sarif: ## Check for Vulnerabilities
-	govulncheck -format=sarif ./... > govulncheck.sarif
+vulncheck-sarif: workspace ## Check for Vulnerabilities
+	govulncheck -format=sarif ./... ./crdbotel/... ./crdbprom/... > govulncheck.sarif
 
 .PHONY: generate
 generate: # Generate latest SDK

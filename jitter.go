@@ -14,10 +14,12 @@ type Jitter interface {
 // JitteredTicker is a ticker with an additional jitter applied to the interval.
 // Similar to time.Ticker but with randomized intervals.
 type JitteredTicker struct {
+	// Jitter determines the delay between ticks. It must not be nil.
+	Jitter
+	// C receives ticks and is closed when the ticker's loop stops.
 	C         <-chan time.Time
 	controlCh chan struct{}
-	Jitter
-	interval time.Duration
+	interval  time.Duration
 }
 
 // NewJitteredTicker creates a new jittered ticker that ticks at intervals
@@ -34,7 +36,7 @@ func NewJitteredTicker(d time.Duration, j Jitter) *JitteredTicker {
 	return t
 }
 
-// Stop stops the jittered ticker. After Stop, no more ticks will be sent.
+// Stop requests that the ticker stop and close C. It must be called only once.
 func (t *JitteredTicker) Stop() {
 	close(t.controlCh)
 }
@@ -64,8 +66,11 @@ func (t *JitteredTicker) loop(c chan<- time.Time) {
 // The jittered duration is uniformly distributed between Min and the provided duration.
 // This helps distribute load more evenly and prevents synchronized retries across clients.
 type UniformJitter struct {
+	// Source supplies randomness. A nil Source uses the default random source.
+	// A non-nil Source must not be shared concurrently without synchronization.
 	Source *rand.Rand
-	Min    time.Duration
+	// Min is the inclusive lower bound of the jittered duration.
+	Min time.Duration
 }
 
 // Jitter returns a duration uniformly distributed over the range [Min, d).

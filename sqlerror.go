@@ -117,10 +117,13 @@ func sqlErrorCode(err error) string {
 
 // MaxRetryError is returned when the maximum number of retries has been exceeded.
 type MaxRetryError struct {
+	// MaxRetries is the configured retry limit. Zero means retries were disabled.
 	MaxRetries uint
-	LastErr    error
+	// LastErr is the error from the final attempt.
+	LastErr error
 }
 
+// Error describes the exhausted retry limit and the last error, if present.
 func (e *MaxRetryError) Error() string {
 	if e.MaxRetries == 0 {
 		if e.LastErr != nil {
@@ -136,10 +139,12 @@ func (e *MaxRetryError) Error() string {
 	return fmt.Sprintf("max retries reached (%d): %s", e.MaxRetries, e.LastErr.Error())
 }
 
+// Unwrap returns LastErr.
 func (e *MaxRetryError) Unwrap() error {
 	return e.LastErr
 }
 
+// GRPCStatus returns the last error's gRPC status, or nil if it has none.
 func (e *MaxRetryError) GRPCStatus() *status.Status {
 	s, ok := status.FromError(e.Unwrap())
 	if !ok {
@@ -150,9 +155,11 @@ func (e *MaxRetryError) GRPCStatus() *status.Status {
 
 // ResettableError wraps an error that requires connection reset and retry on a different node.
 type ResettableError struct {
+	// Err is the underlying error that requires replacing the connection.
 	Err error
 }
 
+// Error describes the resettable error and its underlying cause, if present.
 func (e *ResettableError) Error() string {
 	s := errMsgResettable
 	if e.Err != nil {
@@ -161,19 +168,23 @@ func (e *ResettableError) Error() string {
 	return s
 }
 
+// Unwrap returns Err.
 func (e *ResettableError) Unwrap() error {
 	return e.Err
 }
 
+// GRPCStatus returns an Unavailable status describing the resettable error.
 func (e *ResettableError) GRPCStatus() *status.Status {
 	return status.New(codes.Unavailable, e.Error())
 }
 
 // RetryableError wraps an error that can be retried on the same connection.
 type RetryableError struct {
+	// Err is the underlying error that permits retrying on the same connection.
 	Err error
 }
 
+// Error describes the retryable error and its underlying cause, if present.
 func (e *RetryableError) Error() string {
 	s := errMsgRetryable
 	if e.Err != nil {
@@ -182,6 +193,7 @@ func (e *RetryableError) Error() string {
 	return s
 }
 
+// Unwrap returns Err.
 func (e *RetryableError) Unwrap() error {
 	return e.Err
 }

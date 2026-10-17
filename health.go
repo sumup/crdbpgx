@@ -2,14 +2,12 @@ package crdbpgx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/time/rate"
 )
 
@@ -27,34 +25,15 @@ const (
 	defaultNodeHealthCloseTimeout = 5 * time.Second
 )
 
-var (
-	newNodeHealthTrackerMetricsOnce = sync.OnceValue(newNodeHealthTrackerMetrics)
-)
-
-type healthTrackerMetrics struct {
-	// healthyNodesGauge records the current healthy node count.
-	healthyNodesGauge metric.Int64Gauge
-}
-
-func newNodeHealthTrackerMetrics() *healthTrackerMetrics {
-	healthyCRDBNodeCountGauge, err := meter.Int64Gauge(
-		"crdb_healthy_nodes",
-		metric.WithDescription("Number of healthy CRDB nodes detected"),
-	)
-	if err != nil {
-		panic(fmt.Errorf("initialize crdb health nodes gauge: %w", err))
-	}
-
-	return &healthTrackerMetrics{
-		healthyNodesGauge: healthyCRDBNodeCountGauge,
-	}
-}
-
-// NodeHealthTracker is responsible for tracking health of a nodes
-// in a CockroachDB cluster.
+// NodeHealthTracker tracks the health of nodes in a CockroachDB cluster.
+// Implementations must be safe for concurrent use by pools and balancers.
 type NodeHealthTracker interface {
+	// SetStatus records a health observation. Implementations may apply a failure
+	// threshold before marking a node unhealthy.
 	SetStatus(nodeID uint32, healthy bool)
+	// IsHealthy reports whether the node is currently considered healthy.
 	IsHealthy(nodeID uint32) bool
+	// NumHealthy returns the number of nodes currently considered healthy.
 	NumHealthy() int
 }
 
@@ -82,8 +61,8 @@ type nodeHealthTracker struct {
 	// pollInterval is the regular health probe interval.
 	pollInterval time.Duration
 
-	// metrics contains shared health tracker metric instruments.
-	metrics *healthTrackerMetrics
+	// hooks observes health updates.
+	hooks hooks
 
 	// topologyChangePollInterval is the accelerated probe interval.
 	topologyChangePollInterval time.Duration
@@ -96,6 +75,7 @@ type nodeHealthTracker struct {
 }
 
 type nodeHealthTrackerConfig struct {
+	hooks hooks
 	// pollInterval configures regular health probes.
 	pollInterval time.Duration
 	// topologyChangePollInterval configures accelerated health probes.
@@ -104,8 +84,21 @@ type nodeHealthTrackerConfig struct {
 	topologyChangePollWindow time.Duration
 }
 
-// NodeHealthTrackerOption is a configuration option for the [nodeHealthTracker].
+// NodeHealthTrackerOption configures a tracker created by [NewNodeHealthTracker].
 type NodeHealthTrackerOption func(*nodeHealthTrackerConfig)
+
+// WithHealthTrackerHooks configures instrumentation on a caller-owned health
+// tracker, including one shared by multiple pools. Hooks are appended in
+// registration order. Nil entries are ignored. Pool hooks do not replace them.
+func WithHealthTrackerHooks(hooks ...Hook) NodeHealthTrackerOption {
+	return func(cfg *nodeHealthTrackerConfig) {
+		for _, hook := range hooks {
+			if hook != nil {
+				cfg.hooks = append(cfg.hooks, hook)
+			}
+		}
+	}
+}
 
 // WithPollInterval configures the interval at which the node health tracker
 // attempts to connect to a random node in the cluster and assert its health.
@@ -130,10 +123,9 @@ func WithTopologyChangePollInterval(interval, window time.Duration) NodeHealthTr
 	}
 }
 
-// NewNodeHealthTracker creates a new [nodeHealthTracker].
-//
-// The tracker periodically probes for healthy nodes in the CockroachDB cluster
-// and tracks their health.
+// NewNodeHealthTracker creates a node health tracker. Call Poll in a goroutine
+// to discover healthy nodes until its context is canceled. When sharing the
+// tracker through [WithHealthTracker], the caller owns its polling lifecycle.
 func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) (_ *nodeHealthTracker, err error) {
 	tCfg := &nodeHealthTrackerConfig{
 		pollInterval:               defaultNodeHealthPollInterval,
@@ -151,7 +143,7 @@ func NewNodeHealthTracker(cfg *pgx.ConnConfig, opts ...NodeHealthTrackerOption) 
 		topologyChangePollWindow:   tCfg.topologyChangePollWindow,
 		healthyNodes:               make(map[uint32]struct{}),
 		nodesSeen:                  make(map[uint32]*rate.Limiter),
-		metrics:                    newNodeHealthTrackerMetricsOnce(),
+		hooks:                      tCfg.hooks,
 		topologyChangeSubscribers:  make([]chan struct{}, 0),
 		newLimiter: func() *rate.Limiter {
 			return rate.NewLimiter(rate.Every(1*time.Minute), 2)
@@ -222,9 +214,9 @@ func (t *nodeHealthTracker) tryConnection(ctx context.Context, interval time.Dur
 
 // SetStatus updates the health status of a node.
 //
-// If healthy is true, the node is marked as healthy. If false, the node is marked
-// as unhealthy only if it has failed more than twice in the last minute (rate limited
-// to prevent marking nodes as unhealthy due to transient errors).
+// A healthy observation marks the node healthy and resets its failure allowance.
+// The tracker tolerates two failures, with the allowance replenished at one
+// failure per minute. Further failures mark the node unhealthy until it recovers.
 func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	t.mu.Lock()
 
@@ -241,7 +233,7 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 		t.nodesSeen[nodeID] = t.newLimiter()
 		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+		t.recordHealthUpdate(nodeID, numHealthy, true)
 		if !wasHealthy && hadHealthyNodes {
 			t.notifyTopologyChange()
 		}
@@ -251,9 +243,10 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	// If the limiter allows the request, we haven't seen more than 2 failures in the past minute.
 	// Keep the node health
 	if nodeLimiter.Allow() {
+		_, isHealthy := t.healthyNodes[nodeID]
 		numHealthy := len(t.healthyNodes)
 		t.mu.Unlock()
-		t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+		t.recordHealthUpdate(nodeID, numHealthy, isHealthy)
 		return
 	}
 
@@ -262,10 +255,18 @@ func (t *nodeHealthTracker) SetStatus(nodeID uint32, healthy bool) {
 	numHealthy := len(t.healthyNodes)
 	t.mu.Unlock()
 
-	t.metrics.healthyNodesGauge.Record(context.Background(), int64(numHealthy))
+	t.recordHealthUpdate(nodeID, numHealthy, false)
 	if wasHealthy {
 		t.notifyTopologyChange()
 	}
+}
+
+func (t *nodeHealthTracker) recordHealthUpdate(nodeID uint32, count int, healthy bool) {
+	t.hooks.onHealthUpdate(HealthUpdateData{
+		NodeID:       nodeID,
+		Healthy:      healthy,
+		HealthyNodes: count,
+	})
 }
 
 // IsHealthy returns true if the specified node is currently marked as healthy.
@@ -283,6 +284,10 @@ func (t *nodeHealthTracker) NumHealthy() int {
 	return len(t.healthyNodes)
 }
 
+// SubscribeTopologyChanges returns a channel signaled when a known healthy node
+// becomes unhealthy or another healthy node joins an already discovered cluster.
+// Signals may be coalesced. The caller must call the returned unsubscribe function
+// when done; it is safe to call repeatedly and does not close the channel.
 func (t *nodeHealthTracker) SubscribeTopologyChanges() (<-chan struct{}, func()) {
 	ch := make(chan struct{}, 1)
 
