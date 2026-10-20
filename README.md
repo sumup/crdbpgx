@@ -15,98 +15,155 @@ Inspired by AuthZed's [Maximizing CockroachDB Performance: Our Journey to 1 Mill
 > [!IMPORTANT]
 > `crdbpgx` is not a drop-in replacement for `pgx`. It is a CockroachDB-focused wrapper around `pgxpool` that adds node health tracking, connection rebalancing, retry handling, and configurable context propagation. Those behaviors intentionally change how connections are acquired, retried, and managed so applications can better tolerate CockroachDB node failures, draining nodes during upgrades, and gateway imbalance.
 
-## Example
+## Usage
+
+Requires Go 1.27 or later. Install the library:
+
+```sh
+go get github.com/sumup/crdbpgx
+```
+
+The examples below use `context`, `fmt`, and `os` from the standard library,
+plus these packages:
 
 ```go
-package main
-
 import (
-  "context"
-  "fmt"
-  "os"
-  "os/signal"
-  "time"
-
+  "github.com/jackc/pgx/v5"
   "github.com/jackc/pgx/v5/pgxpool"
   "github.com/sumup/crdbpgx"
 )
-
-func main() {
-  // your application context
-  ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
-  defer cancel()
-
-  cfg, err := pgxpool.ParseConfig(os.Getenv("DSN"))
-  if err != nil {
-    panic(fmt.Errorf("parse dsn: %w", err))
-  }
-
-  pool, err := crdbpgx.NewPool(
-    ctx, // context used only while the pool is created
-    cfg,
-    crdbpgx.WithContextPropagationBehaviour(crdbpgx.ContextPropagationOnAcquire),
-    crdbpgx.WithBalancer(crdbpgx.NewNodeConnectionBalancer(
-      crdbpgx.WithBalancingInterval(30*time.Second),
-      crdbpgx.WithBalancingTimeout(10*time.Second),
-    )),
-  )
-  if err != nil {
-    panic(fmt.Errorf("create read pool: %w", err))
-  }
-  defer pool.Close()
-
-  // use your pool
-}
 ```
 
-## Typed Queries and Transactions
+### Create a pool
 
-`Pool` embeds a concrete `Runner`, so typed queries and commands are available
-as `pool.Query`, `pool.QueryRow`, and `pool.Exec` on Go 1.27+:
+Parse a CockroachDB connection URL and create a pool. Close it when your
+application shuts down.
 
 ```go
-users, err := pool.Query(ctx, pgx.RowToStructByName[User], "SELECT id, name FROM users")
+ctx := context.Background()
+cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+if err != nil {
+  return err
+}
 
-err = pool.InTx(ctx, pgx.TxOptions{}, func(tx crdbpgx.Runner) error {
-  user, err := tx.QueryRow(ctx, pgx.RowToStructByName[User],
-    "SELECT id, name FROM users WHERE id = $1", userID)
+pool, err := crdbpgx.NewPool(ctx, cfg,
+  crdbpgx.WithContextPropagationBehaviour(crdbpgx.ContextPropagationOnAcquire),
+)
+if err != nil {
+  return err
+}
+defer pool.Close()
+```
+
+The context passed to `NewPool` controls initialization. The pool manages its
+background work until `Close` is called.
+
+This example uses `ContextPropagationOnAcquire`: caller cancellation applies
+while acquiring a connection, but database operations run detached from it.
+Use `ContextPropagationPassthrough` to pass cancellation and deadlines through
+to database operations. Without this option, the default,
+`ContextPropagationDetach`, detaches both acquisition and database operations.
+
+### Execute a command
+
+Use `Exec` for inserts, updates, and deletes. Pass values as query arguments.
+The returned command tag reports the number of affected rows.
+
+```go
+tag, err := pool.Exec(ctx,
+  "UPDATE users SET name = $1 WHERE id = $2", "Ada", userID)
+if err != nil {
+  return err
+}
+fmt.Println(tag.RowsAffected())
+```
+
+### Query multiple rows
+
+Use `Query` with a pgx row mapper to collect results into a slice. For example,
+`pgx.RowToStructByName` maps column names to struct fields:
+
+```go
+type User struct {
+  ID   int64  `db:"id"`
+  Name string `db:"name"`
+}
+
+users, err := pool.Query(ctx, pgx.RowToStructByName[User],
+  "SELECT id, name FROM users ORDER BY id")
+if err != nil {
+  return err
+}
+fmt.Println(users)
+```
+
+`Query` closes the rows automatically. For a single column, use a scalar mapper
+such as `pgx.RowTo[int64]` instead.
+
+### Query one row
+
+Use `QueryRow` with the same `User` type to fetch the first matching row:
+
+```go
+user, err := pool.QueryRow(ctx, pgx.RowToStructByName[User],
+  "SELECT id, name FROM users WHERE id = $1", userID)
+if err != nil {
+  return err
+}
+fmt.Println(user.Name)
+```
+
+`QueryRow` closes the rows automatically, returns `pgx.ErrNoRows` if no row
+matches, and ignores any rows after the first.
+
+### Run a transaction
+
+Use `InTx` to group operations. Execute each operation through the supplied
+runner so it uses the transaction. Returning nil commits; returning an error
+rolls back.
+
+```go
+err := pool.InTx(ctx, pgx.TxOptions{}, func(tx crdbpgx.Runner) error {
+  _, err := tx.Exec(ctx,
+    "UPDATE users SET name = $1 WHERE id = $2", "Ada", userID)
   if err != nil {
     return err
   }
-  _, err = tx.Exec(ctx, "UPDATE users SET name = $1 WHERE id = $2", name, user.ID)
+  _, err = tx.Exec(ctx,
+    "INSERT INTO user_audit (user_id, action) VALUES ($1, $2)", userID, "renamed")
   return err
 })
+if err != nil {
+  return err
+}
 ```
 
-Store `pool.Runner` in repository code to use the same concrete type inside and
-outside transactions:
+The pool automatically retries retryable errors. For a transaction, it reruns
+the entire callback, so keep external side effects such as sending emails out
+of the callback. Query row mappers can also run again during retries.
+Do not retain the transaction runner after the callback returns.
+
+Calling `InTx` on a transaction runner creates a savepoint. Nested transactions
+inherit the outer transaction's isolation settings; only the outer pool retries
+the whole transaction.
+
+### Share query code
+
+Accept a `crdbpgx.Runner` in helpers that should work both inside and outside a
+transaction:
 
 ```go
-type Repository struct {
-  db crdbpgx.Runner
+func getUser(ctx context.Context, db crdbpgx.Runner, id int64) (User, error) {
+  return db.QueryRow(ctx, pgx.RowToStructByName[User],
+    "SELECT id, name FROM users WHERE id = $1", id)
 }
-
-repo := Repository{db: pool.Runner}
 ```
 
-`Runner.InTx` supplies a transaction-bound `Runner` automatically. Calling it on
-that runner creates a savepoint. Only the outer pool retries the entire
-transaction. Callbacks can execute again during retries and should avoid
-external side effects. Do not retain a transaction runner after its callback.
+Pass `pool.Runner` outside a transaction, or the callback's runner inside one:
 
-Both query methods close their rows. `QueryRow` returns the first row, ignores
-additional rows, and returns `pgx.ErrNoRows` for an empty result. On error,
-`Query` returns nil, `QueryRow` returns the zero value, and `Exec` returns an
-empty command tag. Typed transaction operations honor the pool's configured
-context propagation behavior.
-
-`Executor` is the underlying callback interface for adapters and test doubles.
-`NewRunner(executor)` wraps these implementations. Existing callback methods
-remain available. `InTxFunc` still supplies a `Tx` for callers that need the raw
-`pgx.Tx` methods.
-
-This is a breaking API change: the former `Runner` interface is now `Executor`,
-`Runner` is concrete, and `InTx` callbacks receive `func(Runner) error`.
+```go
+user, err := getUser(ctx, pool.Runner, userID)
+```
 
 ## Components
 
