@@ -3,7 +3,7 @@ module github.com/sumup/crdbpgx/crdbotel
 go 1.27.0
 
 require (
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/stretchr/testify v1.12.1
 	github.com/sumup/crdbpgx v1.1.1
 	go.opentelemetry.io/otel v1.47.0
