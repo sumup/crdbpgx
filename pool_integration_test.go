@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newIntegrationPool(t *testing.T, maxConns int32, opts ...Option) *Pool {
+func newIntegrationPool(t testing.TB, maxConns int32, opts ...Option) *Pool {
 	t.Helper()
 
 	url := os.Getenv("CRDB_TEST_DATABASE_URL")
@@ -74,17 +75,21 @@ func TestIntegrationPool_InTx(t *testing.T) {
 			var attempts int
 			err := pool.InTx(ctx, pgx.TxOptions{}, func(db Runner) error {
 				attempts++
+
+				// Set session variable to enable/disable failures
+				shouldFail := attempts == 1 || tc.alwaysRetry
+				require.NoError(t, db.ExecFunc(
+					ctx,
+					func(_ context.Context, _ pgconn.CommandTag, err error) error { return err },
+					"SET inject_retry_errors_enabled = "+strconv.FormatBool(shouldFail),
+				))
+
 				if err := db.ExecFunc(ctx, func(_ context.Context, _ pgconn.CommandTag, err error) error {
 					return err
 				}, "INSERT INTO "+table+" VALUES (1)"); err != nil {
 					return err
 				}
-				if attempts == 1 || tc.alwaysRetry {
-					// Returning a real serialization failure also aborts the server-side transaction.
-					return db.ExecFunc(ctx, func(_ context.Context, _ pgconn.CommandTag, err error) error {
-						return err
-					}, "SELECT crdb_internal.force_retry('1s'::INTERVAL)")
-				}
+
 				return nil
 			})
 			if tc.wantRows == 1 {
